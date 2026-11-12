@@ -1,5 +1,62 @@
-use super::*;
-use super::{ffi::*, session::*, value::*};
+use std::{
+    ffi::CString,
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    ptr,
+    sync::{Arc, Condvar, Mutex},
+    task::{Context, Poll, Waker},
+};
+
+use onyxrt_sys as sys;
+use snafu::{Snafu, ensure};
+
+use crate::{
+    ffi::{self, IoBindingGuard, MemoryInfoGuard, ValueGuard, check_status},
+    model::Environment,
+    session::{RunOptions, Session},
+    value::{
+        self, Input, IoBindingInput, IoBindingOutput, Output, create_dlpack_memory_info,
+        create_external_tensor, output_to_dlpack,
+    },
+};
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum Error {
+    #[snafu(transparent)]
+    Ffi {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(transparent)]
+    Value { source: value::Error },
+
+    #[snafu(transparent)]
+    Session { source: crate::session::Error },
+
+    #[snafu(display("run options belong to a different ONNX Runtime environment"))]
+    ForeignRunOptions,
+
+    #[snafu(display("ONNX Runtime returned null for {what}"))]
+    NullPointer { what: &'static str },
+
+    #[snafu(display("ONNX Runtime async callback returned {actual} outputs; expected {expected}"))]
+    AsyncOutputCount { expected: usize, actual: usize },
+
+    #[snafu(display("internal Rust callback processing panicked"))]
+    AsyncCallbackPanicked,
+}
+
+impl From<ffi::Error> for Error {
+    fn from(source: ffi::Error) -> Self {
+        Self::Ffi {
+            source: Box::new(source),
+        }
+    }
+}
 
 /// A reusable ONNX Runtime I/O Binding object associated with one session.
 ///
@@ -107,7 +164,10 @@ impl BoundIoBinding<'_, '_> {
 
     /// Executes and synchronizes with explicit reusable run options.
     pub fn run_with_options(&mut self, options: &RunOptions) -> Result<()> {
-        options.ensure_session(self.binding.session)?;
+        ensure!(
+            options.belongs_to(self.binding.session),
+            ForeignRunOptionsSnafu
+        );
         self.run_impl(Some(options))
     }
 
@@ -130,7 +190,8 @@ impl BoundIoBinding<'_, '_> {
         // SAFETY: wait until all provider writes to external outputs complete.
         check_status(api, unsafe {
             (api.table().SynchronizeBoundOutputs)(self.binding.binding)
-        })
+        })?;
+        Ok(())
     }
 }
 
@@ -305,7 +366,8 @@ pub(super) fn async_callback_result(
 ) -> Result<Vec<usize>> {
     if !status.0.is_null() {
         release_callback_outputs(&completion.api, outputs, num_outputs);
-        return check_status(&completion.api, status).map(|()| Vec::new());
+        check_status(&completion.api, status)?;
+        return Ok(Vec::new());
     }
     if num_outputs != completion.expected_outputs {
         release_callback_outputs(&completion.api, outputs, num_outputs);
@@ -328,18 +390,20 @@ pub(super) fn collect_callback_outputs(
     if num_outputs == 0 {
         return Ok(Vec::new());
     }
-    if outputs.is_null() {
-        return Err(Error::NullPointer {
-            what: "async output array",
-        });
-    }
+    ensure!(
+        !outputs.is_null(),
+        NullPointerSnafu {
+            what: "async output array"
+        }
+    );
     // SAFETY: ORT supplies num_outputs entries on a successful callback.
     let values = unsafe { std::slice::from_raw_parts(outputs, num_outputs) };
-    if values.iter().any(|value| value.is_null()) {
-        return Err(Error::NullPointer {
-            what: "async output value",
-        });
-    }
+    ensure!(
+        values.iter().all(|value| !value.is_null()),
+        NullPointerSnafu {
+            what: "async output value"
+        }
+    );
     Ok(values.iter().map(|value| *value as usize).collect())
 }
 
@@ -406,7 +470,8 @@ impl RunFuture<'_> {
     /// Completion remains asynchronous; await the Future to observe the final
     /// ORT status. Cancellation is cooperative and may race with completion.
     pub fn cancel(&self) -> Result<()> {
-        self.run_options.terminate()
+        self.run_options.terminate()?;
+        Ok(())
     }
 
     fn convert_outputs(&mut self, values: Vec<usize>) -> Result<Vec<Output>> {

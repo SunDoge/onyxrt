@@ -30,11 +30,13 @@ the highest priority:
 
 ```rust,no_run
 use onyxrt::{
-    CudaArenaExtendStrategy, CudaExecutionProvider, CudnnConvAlgoSearch,
-    Environment,
+    model::Environment,
+    provider::{
+        CudaArenaExtendStrategy, CudaExecutionProvider, CudnnConvAlgoSearch,
+    },
 };
 
-# fn example() -> onyxrt::Result<()> {
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
 let env = Environment::builder().build()?;
 let session = env
     .session_builder()
@@ -60,13 +62,16 @@ For device-resident tensors, `IoBindingInput` and `IoBindingOutput` bind
 preallocated CPU or CUDA DLPack storage directly through `OrtIoBinding`:
 
 ```rust,no_run
-use onyxrt::{IoBindingInput, IoBindingOutput, Session};
+use onyxrt::{
+    session::Session,
+    value::{IoBindingInput, IoBindingOutput},
+};
 
 fn run_on_cuda(
     session: &Session,
     input: &dlpark::versioned::Dlpack,
     output: &mut dlpark::versioned::Dlpack,
-) -> onyxrt::Result<()> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let inputs = [IoBindingInput::from_dlpack("input", input)?];
     let mut outputs = [IoBindingOutput::from_dlpack("output", output)?];
     session.run_with_iobinding(&inputs, &mut outputs)
@@ -131,9 +136,13 @@ ONYXRT_TEST_TENSORRT=1 ONYXRT_TEST_DYLIB=/path/libonnxruntime.so cargo test -p o
 ```
 
 ```rust,no_run
-use onyxrt::{CpuExecutionProvider, Environment, Input};
+use onyxrt::{
+    model::Environment,
+    provider::CpuExecutionProvider,
+    value::Input,
+};
 
-# fn example(input: &dlpark::versioned::Dlpack) -> onyxrt::Result<()> {
+# fn example(input: &dlpark::versioned::Dlpack) -> Result<(), Box<dyn std::error::Error>> {
 let env = Environment::builder().name("example").build()?;
 let session = env
     .session_builder()
@@ -161,7 +170,7 @@ reusable `RunOptions` created by `Session::run_options`:
 let mut options = session.run_options()?;
 options
     .set_tag("request-42")?
-    .set_log_level(onyxrt::LogLevel::Warning)?;
+    .set_log_level(onyxrt::provider::LogLevel::Warning)?;
 let outputs = session.run_all_with_options(&inputs, &options)?;
 ```
 

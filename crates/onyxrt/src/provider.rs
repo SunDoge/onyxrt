@@ -1,5 +1,36 @@
-use super::ffi::*;
-use super::*;
+use std::{
+    ffi::CString,
+    path::{Path, PathBuf},
+};
+
+use onyxrt_sys as sys;
+use snafu::Snafu;
+#[cfg(target_os = "windows")]
+use snafu::ensure;
+
+use crate::ffi::{self, cstring};
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum Error {
+    #[snafu(transparent)]
+    Ffi {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("model path `{}` contains an interior NUL", path.display()))]
+    InvalidModelPath { path: PathBuf },
+}
+
+impl From<ffi::Error> for Error {
+    fn from(source: ffi::Error) -> Self {
+        Self::Ffi {
+            source: Box::new(source),
+        }
+    }
+}
 
 /// ONNX Runtime logging threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,11 +474,12 @@ impl NativeModelPath {
         use std::os::windows::ffi::OsStrExt;
 
         let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if encoded.contains(&0) {
-            return Err(Error::InvalidModelPath {
+        ensure!(
+            !encoded.contains(&0),
+            InvalidModelPathSnafu {
                 path: path.to_owned(),
-            });
-        }
+            }
+        );
         encoded.push(0);
         Ok(Self(encoded))
     }

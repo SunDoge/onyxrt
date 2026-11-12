@@ -1,4 +1,32 @@
-use super::*;
+use std::{
+    ffi::{CStr, CString, NulError},
+    ptr,
+};
+
+use onyxrt_sys as sys;
+use snafu::Snafu;
+
+use crate::model::Environment;
+
+pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+pub(super) enum Error {
+    #[snafu(display("ONNX Runtime error {code:?}: {message}"))]
+    Runtime {
+        code: sys::OrtErrorCode,
+        message: String,
+    },
+
+    #[snafu(display("ONNX Runtime returned null for {what}"))]
+    NullPointer { what: &'static str },
+
+    #[snafu(display("{kind} name contains an interior NUL byte"))]
+    InvalidName {
+        kind: &'static str,
+        source: NulError,
+    },
+}
 
 pub(super) struct OutputOwner {
     pub(super) environment: Environment,

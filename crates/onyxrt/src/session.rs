@@ -1,5 +1,79 @@
-use super::*;
-use super::{ffi::*, io_binding::*, provider::*, value::*};
+use std::{
+    ffi::CStr,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    ptr,
+    sync::Arc,
+};
+
+use dlpark::versioned;
+use onyxrt_sys as sys;
+use snafu::{Snafu, ensure};
+
+use crate::{
+    ffi::{
+        self, AllocatedBufferGuard, IoBindingGuard, MemoryInfoGuard, TypeInfoGuard, ValueGuard,
+        check_status, cstring, default_allocator, require_const_non_null, require_non_null,
+    },
+    io_binding::{AsyncCompletion, IoBinding, PendingIoBindingRun, RunFuture, async_run_callback},
+    model::{
+        Dimension, Environment, ModelMetadata, TensorInfo, TensorTypeInfo, ValueInfo, ValueTypeInfo,
+    },
+    provider::{
+        self, CpuExecutionProvider, CudaExecutionProvider, DnnlExecutionProvider, ExecutionMode,
+        ExecutionProvider, GraphOptimizationLevel, LogLevel, NamedExecutionProvider,
+        NativeModelPath, OpenVinoExecutionProvider, TensorRtExecutionProvider,
+    },
+    value::{
+        self, Input, IoBindingDeviceOutput, IoBindingInput, IoBindingOutput, IoKind, Output,
+        OutputBuffer, ValueInput, ValueOutput, create_dlpack_memory_info, create_external_tensor,
+        create_map_input, create_sequence_input, create_string_tensor, dlpack_to_onnx,
+        output_to_dlpack, output_to_value,
+    },
+};
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum Error {
+    #[snafu(transparent)]
+    Ffi {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(transparent)]
+    Provider { source: provider::Error },
+
+    #[snafu(transparent)]
+    Value { source: value::Error },
+
+    #[snafu(display("run options belong to a different ONNX Runtime environment"))]
+    ForeignRunOptions,
+
+    #[snafu(display("invalid DLPack tensor: {source}"))]
+    DlpackTensor { source: dlpark::tensor::Error },
+
+    #[snafu(display("ONNX Runtime returned null for {what}"))]
+    NullPointer { what: &'static str },
+
+    #[snafu(display("unsupported ONNX value type {value_type:?}; expected a tensor"))]
+    UnsupportedValueType { value_type: sys::ONNXType },
+
+    #[snafu(display("ONNX Runtime replaced preallocated output `{name}`"))]
+    ReplacedOutput { name: String },
+
+    #[snafu(display("ONNX Runtime I/O Binding returned {actual} outputs; expected {expected}"))]
+    BoundOutputCount { expected: usize, actual: usize },
+}
+
+impl From<ffi::Error> for Error {
+    fn from(source: ffi::Error) -> Self {
+        Self::Ffi {
+            source: Box::new(source),
+        }
+    }
+}
 
 /// Builder for an ONNX Runtime inference session.
 pub struct SessionBuilder {
@@ -416,7 +490,8 @@ pub(super) fn append_openvino_provider(
             encoded.value_pointers.as_ptr(),
             encoded.len(),
         )
-    })
+    })?;
+    Ok(())
 }
 
 pub(super) fn append_dnnl_provider(
@@ -469,7 +544,8 @@ pub(super) fn append_named_provider(
             encoded.value_pointers.as_ptr(),
             encoded.len(),
         )
-    })
+    })?;
+    Ok(())
 }
 
 pub(super) struct SessionOptionsGuard<'a> {
@@ -605,7 +681,8 @@ impl RunOptions {
         // SAFETY: ORT permits termination to be requested while a run is active.
         check_status(api, unsafe {
             (api.table().RunOptionsSetTerminate)(self.as_mut_ptr())
-        })
+        })?;
+        Ok(())
     }
 
     /// Clears a previous cooperative termination request.
@@ -614,15 +691,17 @@ impl RunOptions {
         // SAFETY: the options are live and ORT synchronizes its terminate state.
         check_status(api, unsafe {
             (api.table().RunOptionsUnsetTerminate)(self.as_mut_ptr())
-        })
+        })?;
+        Ok(())
     }
 
     pub(super) fn ensure_session(&self, session: &Session) -> Result<()> {
-        if Arc::ptr_eq(&self.environment.inner, &session.environment.inner) {
-            Ok(())
-        } else {
-            Err(Error::ForeignRunOptions)
-        }
+        ensure!(self.belongs_to(session), ForeignRunOptionsSnafu);
+        Ok(())
+    }
+
+    pub(super) fn belongs_to(&self, session: &Session) -> bool {
+        Arc::ptr_eq(&self.environment.inner, &session.environment.inner)
     }
 
     pub(super) fn as_ptr(&self) -> *const sys::OrtRunOptions {
@@ -839,7 +918,7 @@ impl Session {
         let infos = self.outputs()?;
         let output_names = infos
             .iter()
-            .map(|info| cstring(info.name(), "output"))
+            .map(|info| cstring(info.name(), "output").map_err(Error::from))
             .collect::<Result<Vec<_>>>()?;
         let names = infos.into_iter().map(|info| info.name).collect::<Vec<_>>();
 
@@ -1008,7 +1087,7 @@ impl Session {
 
         let output_cstrings = output_names
             .iter()
-            .map(|name| cstring(name, "output"))
+            .map(|name| cstring(name, "output").map_err(Error::from))
             .collect::<Result<Vec<_>>>()?;
         let input_name_ptrs = inputs
             .iter()
@@ -1043,7 +1122,7 @@ impl Session {
                 // SAFETY: ORT initialized this caller-owned output.
                 unsafe { (api.table().ReleaseValue)(value) };
             }
-            return Err(error);
+            return Err(error.into());
         }
         if output_values.iter().any(|value| value.is_null()) {
             for value in output_values.into_iter().filter(|value| !value.is_null()) {
@@ -1142,7 +1221,7 @@ impl Session {
 
         let output_cstrings = output_names
             .iter()
-            .map(|name| cstring(name, "output"))
+            .map(|name| cstring(name, "output").map_err(Error::from))
             .collect::<Result<Vec<_>>>()?;
         let input_name_ptrs = inputs
             .iter()
@@ -1177,7 +1256,7 @@ impl Session {
                 // SAFETY: ORT initialized this output and ownership was not transferred.
                 unsafe { (api.table().ReleaseValue)(value) };
             }
-            return Err(error);
+            return Err(error.into());
         }
 
         drop(memory_guard);

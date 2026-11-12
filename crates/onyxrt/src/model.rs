@@ -1,5 +1,46 @@
-use super::*;
-use super::{ffi::*, session::SessionBuilder};
+use std::{
+    ffi::{CStr, OsStr},
+    path::PathBuf,
+    ptr,
+    sync::Arc,
+};
+
+use onyxrt_sys as sys;
+use snafu::Snafu;
+
+use crate::{
+    ffi::{
+        self, AllocatedBufferGuard, AvailableProvidersGuard, check_status, cstring,
+        default_allocator, discard_provider_array, require_const_non_null, require_non_null,
+    },
+    provider::{CpuExecutionProvider, ExecutionMode, GraphOptimizationLevel, LogLevel},
+    session::SessionBuilder,
+};
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum Error {
+    #[snafu(transparent)]
+    Ffi {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("failed to initialize ONNX Runtime"))]
+    LoadRuntime { source: sys::Error },
+
+    #[snafu(display("ONNX Runtime returned invalid provider count {count}"))]
+    InvalidProviderCount { count: i32 },
+}
+
+impl From<ffi::Error> for Error {
+    fn from(source: ffi::Error) -> Self {
+        Self::Ffi {
+            source: Box::new(source),
+        }
+    }
+}
 
 /// An ONNX tensor element type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

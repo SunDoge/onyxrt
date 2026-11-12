@@ -5,10 +5,15 @@ use dlpark::{
 };
 use ndarray::arr1;
 use onyxrt::{
-    CpuExecutionProvider, CudaExecutionProvider, Dimension, DnnlExecutionProvider, ElementType,
-    Environment, Input, InputValue, IoBindingDeviceOutput, IoBindingInput, IoBindingOutput,
-    LogLevel, MapInput, OutputBuffer, SequenceInput, StringInput, TensorRtExecutionProvider, Value,
-    ValueInput, ValueTypeInfo,
+    model::{Dimension, ElementType, Environment, ValueTypeInfo},
+    provider::{
+        CpuExecutionProvider, CudaExecutionProvider, DnnlExecutionProvider, LogLevel,
+        TensorRtExecutionProvider,
+    },
+    value::{
+        Input, InputValue, IoBindingDeviceOutput, IoBindingInput, IoBindingOutput, MapInput,
+        OutputBuffer, SequenceInput, StringInput, Value, ValueInput,
+    },
 };
 
 // A minimal ONNX ModelProto: float[3] y = Identity(float[3] x), opset 13.

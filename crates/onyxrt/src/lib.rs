@@ -1,5 +1,12 @@
 //! Safe, CPU-first ONNX Runtime bindings with DLPack interoperability.
 
-mod api;
+pub mod io_binding;
+pub mod model;
+pub mod provider;
+pub mod session;
+pub mod value;
 
-pub use api::*;
+mod ffi;
+
+#[cfg(test)]
+mod tests;

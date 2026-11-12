@@ -1,4 +1,25 @@
-use super::*;
+use std::ptr;
+
+use dlpark::{
+    DlpackFlags,
+    ffi::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType},
+    metadata::Dynamic,
+};
+use onyxrt_sys as sys;
+
+use crate::{
+    io_binding::{
+        Error as IoBindingError, PendingIoBindingRun, RunFuture, collect_callback_outputs,
+    },
+    provider::{
+        CudaArenaExtendStrategy, CudaExecutionProvider, CudnnConvAlgoSearch, DnnlExecutionProvider,
+        Error as ProviderError, TensorRtExecutionProvider,
+    },
+    value::{
+        Error as ValueError, Input, IoBindingInput, IoBindingOutput, OutputBuffer, StringInput,
+        dlpack_to_onnx, onnx_to_dlpack,
+    },
+};
 
 fn assert_send<T: Send>() {}
 fn assert_send_sync<T: Send + Sync>() {}
@@ -22,7 +43,7 @@ fn accepts_null_output_array_for_zero_output_callback() {
     );
     assert!(matches!(
         collect_callback_outputs(ptr::null_mut(), 1),
-        Err(Error::NullPointer {
+        Err(IoBindingError::NullPointer {
             what: "async output array"
         })
     ));
@@ -34,18 +55,18 @@ fn validates_string_tensor_inputs() {
     assert!(scalar.shape().is_empty());
     assert!(matches!(
         StringInput::new("text", vec![2], ["one"]),
-        Err(Error::StringElementCount {
+        Err(ValueError::StringElementCount {
             expected: 2,
             actual: 1
         })
     ));
     assert!(matches!(
         StringInput::new("text", vec![-1], std::iter::empty::<&str>()),
-        Err(Error::InvalidStringDimension { axis: 0, value: -1 })
+        Err(ValueError::InvalidStringDimension { axis: 0, value: -1 })
     ));
     assert!(matches!(
         StringInput::new("text", vec![1], ["bad\0value"]),
-        Err(Error::InvalidStringElement { index: 0, .. })
+        Err(ValueError::InvalidStringElement { index: 0, .. })
     ));
 }
 
@@ -75,7 +96,7 @@ fn rejects_vector_lanes() {
     };
     assert!(matches!(
         dlpack_to_onnx(vector),
-        Err(Error::UnsupportedDlpackType { .. })
+        Err(ValueError::UnsupportedDlpackType { .. })
     ));
 }
 
@@ -226,7 +247,7 @@ fn round_trips_all_supported_dlpack_types() {
 fn rejects_onnx_strings_for_dlpack() {
     assert!(matches!(
         onnx_to_dlpack(sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING),
-        Err(Error::UnsupportedOnnxType { .. })
+        Err(ValueError::UnsupportedOnnxType { .. })
     ));
 }
 
@@ -257,7 +278,7 @@ fn rejects_padded_subbyte_dlpack_layout() {
     let tensor = unsafe { initialized.finish() };
     assert!(matches!(
         Input::from_dlpack("x", &tensor),
-        Err(Error::UnsupportedDlpackFlags { .. })
+        Err(ValueError::UnsupportedDlpackFlags { .. })
     ));
 }
 
@@ -281,7 +302,7 @@ fn rejects_read_only_preallocated_output() {
     let mut tensor = unsafe { initialized.finish() };
     assert!(matches!(
         OutputBuffer::from_dlpack("y", &mut tensor),
-        Err(Error::DlpackTensor { .. })
+        Err(ValueError::DlpackTensor { .. })
     ));
 }
 
@@ -330,7 +351,7 @@ fn rejects_nul_in_provider_options() {
     let provider = DnnlExecutionProvider::new().option("bad\0key", "value");
     assert!(matches!(
         provider.options.encode("oneDNN provider option"),
-        Err(Error::InvalidName { .. })
+        Err(ProviderError::Ffi { .. })
     ));
 }
 
@@ -374,6 +395,6 @@ fn rejects_negative_cuda_iobinding_device() {
     let tensor = unsafe { initialized.finish() };
     assert!(matches!(
         IoBindingInput::from_dlpack("x", &tensor),
-        Err(Error::UnsupportedIoBindingDevice { .. })
+        Err(ValueError::UnsupportedIoBindingDevice { .. })
     ));
 }

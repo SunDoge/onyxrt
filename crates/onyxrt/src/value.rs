@@ -1,5 +1,135 @@
-use super::ffi::*;
-use super::*;
+use std::{
+    ffi::{CStr, CString, NulError},
+    ptr,
+    string::FromUtf8Error,
+};
+
+use dlpark::{
+    DlpackFlags, Managed, ManagedTensorBase, TensorMut, TensorRef, TensorView,
+    ffi::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType},
+    metadata::Dynamic,
+    versioned,
+};
+use onyxrt_sys as sys;
+use snafu::{Snafu, ensure};
+
+use crate::{
+    ffi::{
+        self, OutputOwner, ShapeInfoGuard, TypeInfoGuard, ValueGuard, check_status, cstring,
+        default_allocator, require_const_non_null, require_non_null,
+    },
+    model::Environment,
+};
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum Error {
+    #[snafu(transparent)]
+    Ffi {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("invalid DLPack tensor: {source}"))]
+    DlpackTensor { source: dlpark::tensor::Error },
+
+    #[snafu(display("could not create DLPack output metadata: {source}"))]
+    DlpackMetadata { source: dlpark::metadata::Error },
+
+    #[snafu(display(
+        "DLPack device {:?}:{} is unsupported; expected CPU:0",
+        device_type,
+        device_id
+    ))]
+    UnsupportedDevice {
+        device_type: DLDeviceType,
+        device_id: i32,
+    },
+
+    #[snafu(display(
+        "DLPack device {:?}:{} is unsupported for I/O Binding; expected CPU:0 or CUDA:<non-negative>",
+        device_type,
+        device_id
+    ))]
+    UnsupportedIoBindingDevice {
+        device_type: DLDeviceType,
+        device_id: i32,
+    },
+
+    #[snafu(display("ONNX Runtime tensor memory `{name}` on device {device_id} is unsupported"))]
+    UnsupportedOrtMemory { name: String, device_id: i32 },
+
+    #[snafu(display(
+        "unsupported DLPack dtype (code={}, bits={}, lanes={})",
+        dtype.code.0,
+        dtype.bits,
+        dtype.lanes
+    ))]
+    UnsupportedDlpackType { dtype: DLDataType },
+
+    #[snafu(display(
+        "unsupported DLPack flags {flags:?} for dtype (code={}, bits={}, lanes={})",
+        dtype.code.0,
+        dtype.bits,
+        dtype.lanes
+    ))]
+    UnsupportedDlpackFlags {
+        flags: DlpackFlags,
+        dtype: DLDataType,
+    },
+
+    #[snafu(display("unsupported ONNX tensor element type {element_type:?}"))]
+    UnsupportedOnnxType {
+        element_type: sys::ONNXTensorElementDataType,
+    },
+
+    #[snafu(display("unsupported ONNX value type {value_type:?}; expected a tensor"))]
+    UnsupportedValueType { value_type: sys::ONNXType },
+
+    #[snafu(display("ONNX Runtime returned null for {what}"))]
+    NullPointer { what: &'static str },
+
+    #[snafu(display("string tensor shape dimension {axis} is negative: {value}"))]
+    InvalidStringDimension { axis: usize, value: i64 },
+
+    #[snafu(display("string tensor shape requires {expected} values, got {actual}"))]
+    StringElementCount { expected: usize, actual: usize },
+
+    #[snafu(display("string tensor element {index} contains an interior NUL byte"))]
+    InvalidStringElement { index: usize, source: NulError },
+
+    #[snafu(display("string tensor element count overflows usize"))]
+    StringElementCountOverflow,
+
+    #[snafu(display("string tensor element {index} is not valid UTF-8"))]
+    InvalidStringUtf8 { index: usize, source: FromUtf8Error },
+
+    #[snafu(display(
+        "string tensor element {index} has invalid byte range {start}..{end} for {data_len} bytes"
+    ))]
+    InvalidStringOffsets {
+        index: usize,
+        start: usize,
+        end: usize,
+        data_len: usize,
+    },
+
+    #[snafu(display("{kind} value contained {actual} children; expected {expected}"))]
+    ContainerValueCount {
+        kind: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl From<ffi::Error> for Error {
+    fn from(source: ffi::Error) -> Self {
+        Self::Ffi {
+            source: Box::new(source),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum IoKind {
@@ -8,7 +138,7 @@ pub(super) enum IoKind {
     Initializer,
 }
 
-/// A named DLPack output returned by [`Session::run_all`].
+/// A named DLPack output returned by [`crate::session::Session::run_all`].
 pub struct Output {
     pub(super) name: String,
     pub(super) tensor: versioned::Dlpack,
@@ -57,7 +187,7 @@ pub enum Value {
     Optional(Option<Box<Value>>),
 }
 
-/// A named runtime value returned by [`Session::run_values`].
+/// A named runtime value returned by [`crate::session::Session::run_values`].
 pub struct ValueOutput {
     pub(super) name: String,
     pub(super) value: Value,
@@ -238,7 +368,7 @@ impl<'a> MapInput<'a> {
     }
 }
 
-/// A heterogeneous model input accepted by [`Session::run_values`].
+/// A heterogeneous model input accepted by [`crate::session::Session::run_values`].
 pub enum ValueInput<'a> {
     /// A borrowed compact CPU DLPack tensor.
     Tensor(Input<'a>),
@@ -312,12 +442,13 @@ pub struct IoBindingDeviceOutput {
 impl IoBindingDeviceOutput {
     /// Requests an ORT-allocated CUDA output on `device_id`.
     pub fn cuda(name: &str, device_id: i32) -> Result<Self> {
-        if device_id < 0 {
-            return Err(Error::UnsupportedIoBindingDevice {
+        ensure!(
+            device_id >= 0,
+            UnsupportedIoBindingDeviceSnafu {
                 device_type: DLDeviceType::CUDA,
                 device_id,
-            });
-        }
+            }
+        );
         Ok(Self {
             name: cstring(name, "I/O Binding device output")?,
             device: DLDevice {
@@ -459,12 +590,13 @@ impl<'a> Input<'a> {
 pub(super) fn validate_cpu_compact(tensor: &impl TensorView) -> Result<()> {
     let tensor = tensor.as_raw_tensor();
     let device = tensor.device();
-    if device.device_type != DLDeviceType::CPU || device.device_id != 0 {
-        return Err(Error::UnsupportedDevice {
+    ensure!(
+        device.device_type == DLDeviceType::CPU && device.device_id == 0,
+        UnsupportedDeviceSnafu {
             device_type: device.device_type,
             device_id: device.device_id,
-        });
-    }
+        }
+    );
     if !tensor
         .is_compact()
         .map_err(|source| Error::DlpackTensor { source })?
@@ -481,12 +613,13 @@ pub(super) fn validate_iobinding_compact(tensor: &impl TensorView) -> Result<()>
     let device = tensor.device();
     let supported = (device.device_type == DLDeviceType::CPU && device.device_id == 0)
         || (device.device_type == DLDeviceType::CUDA && device.device_id >= 0);
-    if !supported {
-        return Err(Error::UnsupportedIoBindingDevice {
+    ensure!(
+        supported,
+        UnsupportedIoBindingDeviceSnafu {
             device_type: device.device_type,
             device_id: device.device_id,
-        });
-    }
+        }
+    );
     if !tensor
         .is_compact()
         .map_err(|source| Error::DlpackTensor { source })?
@@ -530,7 +663,7 @@ pub(super) fn create_dlpack_memory_info(
             device_id: device.device_id,
         });
     }
-    require_non_null(memory_info, "DLPack memory info")
+    Ok(require_non_null(memory_info, "DLPack memory info")?)
 }
 
 pub(super) fn create_external_tensor(
@@ -559,13 +692,14 @@ pub(super) fn create_external_tensor(
             &mut value,
         )
     })?;
-    require_non_null(value, "I/O Binding tensor value")
+    Ok(require_non_null(value, "I/O Binding tensor value")?)
 }
 
 pub(super) fn validate_dlpack_flags(flags: DlpackFlags, dtype: DLDataType) -> Result<()> {
-    if flags.contains(DlpackFlags::IS_SUBBYTE_TYPE_PADDED) {
-        return Err(Error::UnsupportedDlpackFlags { flags, dtype });
-    }
+    ensure!(
+        !flags.contains(DlpackFlags::IS_SUBBYTE_TYPE_PADDED),
+        UnsupportedDlpackFlagsSnafu { flags, dtype }
+    );
     Ok(())
 }
 
@@ -597,20 +731,19 @@ where
                 .map_err(|source| Error::InvalidStringElement { index, source })
         })
         .collect::<Result<Vec<_>>>()?;
-    if values.len() != expected {
-        return Err(Error::StringElementCount {
+    ensure!(
+        values.len() == expected,
+        StringElementCountSnafu {
             expected,
             actual: values.len(),
-        });
-    }
+        }
+    );
     Ok(values)
 }
 
 pub(super) fn dlpack_to_onnx(dtype: DLDataType) -> Result<sys::ONNXTensorElementDataType> {
     use sys::ONNXTensorElementDataType as O;
-    if dtype.lanes != 1 {
-        return Err(Error::UnsupportedDlpackType { dtype });
-    }
+    ensure!(dtype.lanes == 1, UnsupportedDlpackTypeSnafu { dtype });
     let value = match (dtype.code, dtype.bits) {
         (DLDataTypeCode::FLOAT, 16) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
         (DLDataTypeCode::FLOAT, 32) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
@@ -804,7 +937,7 @@ pub(super) fn create_container_input(
     check_status(api, unsafe {
         (api.table().CreateValue)(pointers, children.len(), value_type, &mut value)
     })?;
-    require_non_null(value, description)
+    Ok(require_non_null(value, description)?)
 }
 
 pub(super) fn output_to_value(
