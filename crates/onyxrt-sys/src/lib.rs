@@ -131,7 +131,7 @@ impl Api {
         Self::from_library(library, path)
     }
 
-    /// Acquires the configured runtime and negotiates C API v21.
+    /// Acquires the configured runtime and negotiates C API v31.
     ///
     /// Checks `ORT_DYLIB_PATH`, library directories, and platform loader names.
     pub fn load_default() -> Result<Self, Error> {
@@ -258,8 +258,8 @@ fn default_library_names() -> Vec<OsString> {
         vec![
             OsString::from("libonnxruntime.so"),
             OsString::from("libonnxruntime.so.1"),
-            OsString::from("libonnxruntime.so.1.21"),
-            OsString::from("libonnxruntime.so.1.21.0"),
+            OsString::from("libonnxruntime.so.1.31"),
+            OsString::from("libonnxruntime.so.1.31.1"),
         ]
     }
 }

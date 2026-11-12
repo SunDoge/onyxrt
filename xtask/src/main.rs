@@ -8,9 +8,23 @@ use std::{
 use sha2::{Digest, Sha256};
 use usage_rs::{Args, Cli, Subcommands};
 
-const ORT_VERSION: &str = "1.21.0";
-const HEADER_URL: &str = "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.21.0/include/onnxruntime/core/session/onnxruntime_c_api.h";
-const HEADER_SHA256: &str = "7783e9664bdb0b1b36145b5c8587dd1bc9a399aa000edf2e3dd03003cafc6882";
+const ORT_VERSION: &str = "1.31.1";
+const HEADER_URL: &str = "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.31.1/include/onnxruntime/core/session/onnxruntime_c_api.h";
+const HEADER_BASE_URL: &str = "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.31.1/include/onnxruntime/core/session";
+const HEADERS: &[(&str, &str)] = &[
+    (
+        "onnxruntime_c_api.h",
+        "43d584f596ef66820421317df32a79a95fc1d39ee46cb3971a870c08d8ba4baa",
+    ),
+    (
+        "onnxruntime_error_code.h",
+        "5ce3b054e798eced8d14f5b86e98692fd33470463f96194ce0700a2d53dd8721",
+    ),
+    (
+        "onnxruntime_ep_c_api.h",
+        "b64036772115dbc6f06a900487ce22d34e862100db03e2ad62210758e27a19b2",
+    ),
+];
 
 /// Maintain generated source files for onyxrt.
 #[derive(Cli)]
@@ -52,33 +66,31 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn download_header(check: bool) -> Result<(), Box<dyn Error>> {
-    let response = reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("onyxrt-xtask/", env!("CARGO_PKG_VERSION")))
-        .build()?
-        .get(HEADER_URL)
-        .send()?
-        .error_for_status()?;
-    let contents = response.bytes()?;
-    let actual_hash = format!("{:x}", Sha256::digest(&contents));
-    if actual_hash != HEADER_SHA256 {
-        return Err(format!(
-            "downloaded ONNX Runtime v{ORT_VERSION} header has SHA-256 {actual_hash}; expected {HEADER_SHA256}"
-        )
-        .into());
-    }
+        .build()?;
+    for &(name, expected_hash) in HEADERS {
+        let contents = client
+            .get(format!("{HEADER_BASE_URL}/{name}"))
+            .send()?
+            .error_for_status()?
+            .bytes()?;
+        let actual_hash = format!("{:x}", Sha256::digest(&contents));
+        if actual_hash != expected_hash {
+            return Err(format!(
+                "downloaded ONNX Runtime v{ORT_VERSION} {name} has SHA-256 {actual_hash}; expected {expected_hash}"
+            )
+            .into());
+        }
 
-    let destination = header_path();
-    if check {
-        check_contents(&destination, &contents, "ONNX Runtime header")?;
-        println!("vendored ONNX Runtime v{ORT_VERSION} header is current");
-    } else if write_if_changed(&destination, &contents)? {
-        println!(
-            "downloaded ONNX Runtime v{ORT_VERSION} header to {}",
-            destination.display()
-        );
-    } else {
-        println!("ONNX Runtime v{ORT_VERSION} header is already current");
+        let destination = header_directory().join(name);
+        if check {
+            check_contents(&destination, &contents, "ONNX Runtime header")?;
+        } else if write_if_changed(&destination, &contents)? {
+            println!("downloaded {name} to {}", destination.display());
+        }
     }
+    println!("vendored ONNX Runtime v{ORT_VERSION} header bundle is current");
     Ok(())
 }
 
@@ -91,7 +103,13 @@ fn generate_bindings(check: bool) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    verify_file_hash(&header, HEADER_SHA256, "vendored ONNX Runtime header")?;
+    for &(name, expected_hash) in HEADERS {
+        verify_file_hash(
+            &header_directory().join(name),
+            expected_hash,
+            "vendored ONNX Runtime header",
+        )?;
+    }
 
     // ORTCHAR_T is a platform-dependent macro in the upstream header. If
     // bindgen expands it while running on Linux, path-taking APIs are emitted
@@ -103,6 +121,7 @@ fn generate_bindings(check: bool) -> Result<(), Box<dyn Error>> {
         .replace("#define ORTCHAR_T char", "typedef char ORTCHAR_T;");
     let bindings = bindgen::Builder::default()
         .header_contents("onnxruntime_c_api.h", &header_contents)
+        .clang_arg(format!("-I{}", header_directory().display()))
         .clang_arg("-DORT_API_MANUAL_INIT")
         .allowlist_function("OrtGetApiBase")
         .allowlist_type("(ONNX|Ort|GraphOptimizationLevel|ExecutionMode).*")
@@ -130,7 +149,12 @@ fn generate_bindings(check: bool) -> Result<(), Box<dyn Error>> {
          // Source: ONNX Runtime v{ORT_VERSION} ({HEADER_URL})\n\n\
          // Copyright (c) Microsoft Corporation. Licensed under the MIT License.\n\n\
          #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]\n\
-         #![allow(clippy::missing_safety_doc, clippy::tabs_in_doc_comments, clippy::type_complexity)]\n\n\
+         #![allow(\n\
+             clippy::doc_lazy_continuation,\n\
+             clippy::missing_safety_doc,\n\
+             clippy::tabs_in_doc_comments,\n\
+             clippy::type_complexity\n\
+         )]\n\n\
          {bindings}\n"
     );
     let generated = format_rust_source(&generated)?;
@@ -155,7 +179,11 @@ fn workspace_root() -> PathBuf {
 }
 
 fn header_path() -> PathBuf {
-    workspace_root().join("vendor/onnxruntime/onnxruntime_c_api.h")
+    header_directory().join("onnxruntime_c_api.h")
+}
+
+fn header_directory() -> PathBuf {
+    workspace_root().join("vendor/onnxruntime")
 }
 
 fn bindings_path() -> PathBuf {

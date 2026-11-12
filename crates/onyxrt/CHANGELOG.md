@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- add accessors for runtime tensor element types and shapes
+- add zero-copy conversion from owned ORT tensors into DLPack
+
+### Fixed
+
+- allow empty CPU tensors whose runtime data pointer is null to be borrowed as empty slices
+
+### Changed
+
+- split values into owned `Value`, read-only borrowed `ValueRef`, and writable
+  borrowed `ValueMut`
+- update the runtime baseline to ONNX Runtime 1.31.1 / C API v31
+
 ## [0.1.1](https://github.com/SunDoge/onyxrt/releases/tag/onyxrt-v0.1.1) - 2026-11-12
 
 ### Other

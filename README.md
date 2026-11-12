@@ -4,7 +4,7 @@ Safe Rust bindings for the ONNX Runtime C API. The runtime is loaded dynamically
 so applications can use an official ONNX Runtime release or a library shipped in
 a Python wheel without compiling ONNX Runtime themselves.
 
-The workspace targets ONNX Runtime C API v21 (ONNX Runtime 1.21 or newer):
+The workspace targets ONNX Runtime C API v31 (ONNX Runtime 1.31 or newer):
 
 - `onyxrt-sys` contains the generated ABI definitions and dynamic loader.
 - `onyxrt` provides environments, reusable session configuration, execution
@@ -74,20 +74,22 @@ configuration entries.
 
 ## Values and inference
 
-The core API accepts `value::Value`. This keeps tensor-framework policy outside
-`Session` and gives all adapters one execution path.
+The core API separates independent values from external storage: `Value` owns
+its ORT storage, `ValueRef<'a>` borrows it read-only, and `ValueMut<'a>` borrows
+it mutably. All three can be used as session inputs; only writable values can
+be used as preallocated outputs.
 
 ```rust,ignore
 use onyxrt::{
     model::Environment,
-    value::{Input, MemoryInfo, Value},
+    value::{Input, MemoryInfo, ValueMut},
 };
 
 let environment = Environment::builder().build()?;
 let session = environment.session_builder().build_from_file("model.onnx")?;
 let memory = MemoryInfo::cpu(environment.clone())?;
 let mut data = [1.0_f32, 2.0, 3.0];
-let value = Value::tensor(environment, &memory, &mut data, [3])?;
+let value = ValueMut::tensor(environment, &memory, &mut data, [3])?;
 let inputs = [Input::new("input", &value)?];
 let outputs = session.run(&inputs, &["output"])?;
 let output: &[f32] = outputs[0].as_slice()?;
@@ -95,9 +97,10 @@ let output: &[f32] = outputs[0].as_slice()?;
 ```
 
 `Value::allocate_tensor` creates ORT-owned CPU tensors. A session `Allocator`
-and `Value::allocate_tensor_in` cover provider allocations. Unsafe
-`Value::from_raw_parts` is available for integrations that already own device
-memory. COO, CSR, and block-sparse values are also supported.
+and `ValueMut::allocate_tensor_in` cover provider allocations. Unsafe
+`ValueRef::from_raw_parts` and `ValueMut::from_raw_parts` are available for
+integrations that already manage device memory. COO, CSR, and block-sparse
+borrowed values are also supported.
 
 Use `Session::run_into` for caller-owned preallocated outputs. For repeated
 runs, bind the same values once:
@@ -133,15 +136,17 @@ DLPack is not part of the default feature set:
 onyxrt = { version = "0.1", features = ["dlpack", "dlpack-ndarray"] }
 ```
 
-`dlpack::Value` validates and adapts a compact CPU or CUDA tensor without a
-copy, then exposes the same value consumed by `Session`:
+`dlpack::from_managed` validates and adapts a compact CPU or CUDA tensor without
+a copy. `dlpack::into_managed` transfers an owned ORT output into DLPack without
+a copy:
 
 ```rust,ignore
 use onyxrt::{dlpack, value::Input};
 
-let value = dlpack::Value::from_managed(environment.clone(), &managed)?;
-let inputs = [Input::new("input", value.as_value())?];
-let outputs = session.run(&inputs, &["output"])?;
+let value = dlpack::from_managed(environment.clone(), &managed)?;
+let inputs = [Input::new("input", &value)?];
+let mut outputs = session.run(&inputs, &["output"])?;
+let managed_output = dlpack::into_managed(outputs.remove(0))?;
 ```
 
 Framework support is controlled independently with `dlpack-candle`,

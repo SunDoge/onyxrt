@@ -9,6 +9,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     mem::{align_of, size_of_val},
+    ops::{Deref, DerefMut},
     pin::Pin,
     ptr::{self, NonNull},
     slice,
@@ -376,14 +377,30 @@ mod private {
     pub trait Sealed {}
 }
 
-/// An owned `OrtValue` that may borrow externally managed tensor storage.
-pub struct Value<'buffer> {
+/// An `OrtValue` whose writable storage or allocator is borrowed.
+pub struct ValueMut<'buffer> {
     environment: Environment,
     value: NonNull<sys::OrtValue>,
     _buffer: PhantomData<&'buffer mut [u8]>,
 }
 
-impl<'buffer> Value<'buffer> {
+/// An `OrtValue` that owns its storage and has no external lifetime dependency.
+pub struct Value {
+    inner: ValueMut<'static>,
+}
+
+// SAFETY: an owned value has no borrowed allocator or storage. Moving its
+// unique handle to another thread does not create concurrent access, and ORT
+// permits values to be released from a thread other than the creating thread.
+unsafe impl Send for Value {}
+
+/// An `OrtValue` that read-only borrows externally managed tensor storage.
+pub struct ValueRef<'buffer> {
+    inner: ValueMut<'buffer>,
+    _buffer: PhantomData<&'buffer [u8]>,
+}
+
+impl<'buffer> ValueMut<'buffer> {
     pub(super) fn environment(&self) -> &Environment {
         &self.environment
     }
@@ -445,32 +462,17 @@ impl<'buffer> Value<'buffer> {
         shape: &[i64],
         element_type: ElementType,
     ) -> Result<Self> {
-        ensure!(
-            Environment::same_runtime(&environment, &memory_info.environment),
-            ForeignEnvironmentSnafu
-        );
-        let api = &memory_info.environment.inner.api;
-        let mut value = ptr::null_mut();
-        // SAFETY: upheld by this function's caller; all descriptor arrays stay
-        // live for the duration of the native constructor call.
-        status_call!(
-            api,
-            CreateTensorWithDataAsOrtValue(
-                memory_info.as_ptr(),
-                data.as_ptr(),
+        // SAFETY: forwarded directly from this function's safety contract.
+        unsafe {
+            create_external_value(
+                environment,
+                memory_info,
+                data,
                 byte_len,
-                shape.as_ptr(),
-                shape.len(),
-                to_native_element_type(element_type),
-                &mut value,
+                shape,
+                element_type,
             )
-        )?;
-        Ok(Self {
-            environment,
-            value: NonNull::new(require_non_null(value, "tensor value")?)
-                .expect("require_non_null returned a non-null pointer"),
-            _buffer: PhantomData,
-        })
+        }
     }
 
     /// Allocates a tensor from a session allocator.
@@ -697,7 +699,7 @@ impl<'buffer> Value<'buffer> {
     ///
     /// `value` must be a uniquely owned live `OrtValue` created by
     /// `environment`. Ownership is transferred to the returned wrapper.
-    pub unsafe fn from_raw_owned(environment: Environment, value: NonNull<sys::OrtValue>) -> Self {
+    unsafe fn from_raw_owned(environment: Environment, value: NonNull<sys::OrtValue>) -> Self {
         Self {
             environment,
             value,
@@ -756,7 +758,7 @@ impl<'buffer> Value<'buffer> {
     ///
     /// ONNX Runtime uses its process-lifetime default CPU allocator for the
     /// returned value, so the child does not borrow its parent.
-    pub fn value_at(&self, index: usize) -> Result<Value<'static>> {
+    pub fn value_at(&self, index: usize) -> Result<Value> {
         let index = i32::try_from(index).map_err(|_| Error::ContainerIndexOverflow { index })?;
         let api = &self.environment.inner.api;
         let allocator = ffi::default_allocator(api)?;
@@ -812,9 +814,9 @@ impl<'buffer> Value<'buffer> {
     ///
     /// # Safety
     ///
-    /// The sparse values allocation must be CPU-accessible. ONNX Runtime 1.21
-    /// cannot report `OrtMemoryInfo` for a sparse value, so this cannot be
-    /// checked dynamically.
+    /// The sparse values allocation must be CPU-accessible. ONNX Runtime does
+    /// not report `OrtMemoryInfo` for a sparse value, so this cannot be checked
+    /// dynamically.
     pub unsafe fn sparse_values<T: TensorElement>(&self) -> Result<&[T]> {
         let info = self.sparse_values_info()?;
         ensure!(
@@ -947,13 +949,34 @@ impl<'buffer> Value<'buffer> {
             }
         );
         ensure!(self.is_cpu_tensor()?, NonCpuMemorySnafu);
+        let length = element_count(&info.shape)?;
+        if length == 0 {
+            // ORT may represent an empty tensor with a null data pointer. Rust
+            // slices still require a non-null, aligned pointer even at length
+            // zero, so use a well-aligned dangling pointer without dereferencing it.
+            return Ok((NonNull::<T>::dangling().as_ptr(), 0));
+        }
         let mut data = ptr::null_mut();
         let api = &self.environment.inner.api;
         // SAFETY: the value is a dense tensor and output storage is writable.
         status_call!(api, GetTensorMutableData(self.value.as_ptr(), &mut data))?;
         let data = require_non_null(data.cast::<T>(), "tensor data")?;
         ensure!(data.align_offset(align_of::<T>()) == 0, MisalignedDataSnafu);
-        Ok((data, element_count(&info.shape)?))
+        Ok((data, length))
+    }
+
+    #[cfg(feature = "dlpack")]
+    pub(crate) fn tensor_data_ptr(&self) -> Result<*mut c_void> {
+        let info = self.tensor_info()?;
+        if element_count(&info.shape)? == 0 {
+            return Ok(ptr::null_mut());
+        }
+        let mut data = ptr::null_mut();
+        let api = &self.environment.inner.api;
+        // SAFETY: tensor_info established that this is a dense tensor and the
+        // output pointer storage is writable. The pointer is not dereferenced.
+        status_call!(api, GetTensorMutableData(self.value.as_ptr(), &mut data))?;
+        Ok(require_non_null(data, "tensor data")?)
     }
 
     fn is_cpu_tensor(&self) -> Result<bool> {
@@ -976,17 +999,85 @@ impl<'buffer> Value<'buffer> {
     }
 }
 
-impl Value<'static> {
-    /// Allocates a tensor owned by ONNX Runtime using its default CPU allocator.
-    pub fn allocate_tensor<T: TensorElement>(
+impl<'buffer> ValueRef<'buffer> {
+    /// Creates a read-only tensor view over arbitrary external storage.
+    ///
+    /// # Safety
+    ///
+    /// `data` must remain valid and correctly aligned for `byte_len` bytes for
+    /// the returned lifetime. The allocation must reside in the device
+    /// described by `memory_info`, and `shape`/`element_type` must accurately
+    /// describe the storage. The storage need not be writable.
+    pub unsafe fn from_raw_parts(
+        environment: Environment,
+        memory_info: &MemoryInfo,
+        data: NonNull<c_void>,
+        byte_len: usize,
+        shape: &[i64],
+        element_type: ElementType,
+    ) -> Result<Self> {
+        Ok(Self {
+            // SAFETY: forwarded directly from this function's safety contract.
+            inner: unsafe {
+                create_external_value(
+                    environment,
+                    memory_info,
+                    data,
+                    byte_len,
+                    shape,
+                    element_type,
+                )?
+            },
+            _buffer: PhantomData,
+        })
+    }
+}
+
+unsafe fn create_external_value<'buffer>(
+    environment: Environment,
+    memory_info: &MemoryInfo,
+    data: NonNull<c_void>,
+    byte_len: usize,
+    shape: &[i64],
+    element_type: ElementType,
+) -> Result<ValueMut<'buffer>> {
+    ensure!(
+        Environment::same_runtime(&environment, &memory_info.environment),
+        ForeignEnvironmentSnafu
+    );
+    let api = &memory_info.environment.inner.api;
+    let mut value = ptr::null_mut();
+    // SAFETY: upheld by this function's caller; all descriptor arrays stay
+    // live for the duration of the native constructor call.
+    status_call!(
+        api,
+        CreateTensorWithDataAsOrtValue(
+            memory_info.as_ptr(),
+            data.as_ptr(),
+            byte_len,
+            shape.as_ptr(),
+            shape.len(),
+            to_native_element_type(element_type),
+            &mut value,
+        )
+    )?;
+    Ok(ValueMut {
+        environment,
+        value: NonNull::new(require_non_null(value, "tensor value")?)
+            .expect("require_non_null returned a non-null pointer"),
+        _buffer: PhantomData,
+    })
+}
+
+impl ValueMut<'static> {
+    fn allocate_owned_tensor<T: TensorElement>(
         environment: Environment,
         shape: impl AsRef<[i64]>,
     ) -> Result<Self> {
-        Self::allocate_tensor_with_type(environment, shape, T::ELEMENT_TYPE)
+        Self::allocate_owned_tensor_with_type(environment, shape, T::ELEMENT_TYPE)
     }
 
-    /// Allocates a tensor with an explicitly selected ONNX element type.
-    pub fn allocate_tensor_with_type(
+    fn allocate_owned_tensor_with_type(
         environment: Environment,
         shape: impl AsRef<[i64]>,
         element_type: ElementType,
@@ -1015,7 +1106,70 @@ impl Value<'static> {
     }
 }
 
-impl Drop for Value<'_> {
+impl Value {
+    /// Allocates an ORT-owned tensor using the process-lifetime CPU allocator.
+    pub fn allocate_tensor<T: TensorElement>(
+        environment: Environment,
+        shape: impl AsRef<[i64]>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: ValueMut::allocate_owned_tensor::<T>(environment, shape)?,
+        })
+    }
+
+    /// Allocates an ORT-owned tensor with an explicit element type.
+    pub fn allocate_tensor_with_type(
+        environment: Environment,
+        shape: impl AsRef<[i64]>,
+        element_type: ElementType,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: ValueMut::allocate_owned_tensor_with_type(environment, shape, element_type)?,
+        })
+    }
+
+    /// Adopts an owned native value returned by the same environment.
+    ///
+    /// # Safety
+    ///
+    /// `value` must be a uniquely owned live `OrtValue` created by
+    /// `environment`. Ownership is transferred to the returned wrapper.
+    pub unsafe fn from_raw_owned(environment: Environment, value: NonNull<sys::OrtValue>) -> Self {
+        Self {
+            // SAFETY: forwarded directly from this function's safety contract.
+            inner: unsafe { ValueMut::from_raw_owned(environment, value) },
+        }
+    }
+
+    /// Releases Rust ownership and returns the native pointer.
+    pub fn into_raw(self) -> *mut sys::OrtValue {
+        self.inner.into_raw()
+    }
+}
+
+impl Deref for Value {
+    type Target = ValueMut<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for Value {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<'buffer> Deref for ValueRef<'buffer> {
+    type Target = ValueMut<'buffer>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for ValueMut<'_> {
     fn drop(&mut self) {
         // SAFETY: this wrapper uniquely owns the live OrtValue.
         unsafe { api_function!(self.environment.inner.api, ReleaseValue)(self.value.as_ptr()) };
@@ -1029,6 +1183,18 @@ pub struct TensorInfo {
     pub element_type: ElementType,
     /// Concrete tensor dimensions.
     pub shape: Vec<i64>,
+}
+
+impl TensorInfo {
+    /// Returns the tensor element type.
+    pub fn element_type(&self) -> ElementType {
+        self.element_type
+    }
+
+    /// Returns the concrete tensor dimensions in model order.
+    pub fn shape(&self) -> &[i64] {
+        &self.shape
+    }
 }
 
 /// ONNX category stored in a [`Value`].
@@ -1155,7 +1321,7 @@ pub struct Output<'value> {
 
 impl<'value> Output<'value> {
     /// Creates a named preallocated output.
-    pub fn new<'buffer>(name: &str, value: &'value mut Value<'buffer>) -> Result<Self> {
+    pub fn new<'buffer>(name: &str, value: &'value mut ValueMut<'buffer>) -> Result<Self> {
         Ok(Self {
             name: cstring(name, "output")?,
             value: value.value,
@@ -1181,7 +1347,7 @@ impl<'value> Output<'value> {
 
 impl<'value> Input<'value> {
     /// Creates a named input without copying its value.
-    pub fn new<'buffer>(name: &str, value: &'value Value<'buffer>) -> Result<Self> {
+    pub fn new<'buffer>(name: &str, value: &'value ValueMut<'buffer>) -> Result<Self> {
         Ok(Self {
             name: cstring(name, "input")?,
             value: value.value,
@@ -1234,7 +1400,7 @@ impl Session {
     }
 
     /// Runs the session with `OrtValue` inputs.
-    pub fn run(&self, inputs: &[Input<'_>], output_names: &[&str]) -> Result<Vec<Value<'static>>> {
+    pub fn run(&self, inputs: &[Input<'_>], output_names: &[&str]) -> Result<Vec<Value>> {
         self.run_impl(inputs, output_names, None)
     }
 
@@ -1244,7 +1410,7 @@ impl Session {
         inputs: &[Input<'_>],
         output_names: &[&str],
         options: &RunOptions,
-    ) -> Result<Vec<Value<'static>>> {
+    ) -> Result<Vec<Value>> {
         ensure!(options.belongs_to(self), ForeignEnvironmentSnafu);
         self.run_impl(inputs, output_names, Some(options))
     }
@@ -1360,7 +1526,7 @@ impl Session {
         inputs: &[Input<'_>],
         output_names: &[&str],
         options: Option<&RunOptions>,
-    ) -> Result<Vec<Value<'static>>> {
+    ) -> Result<Vec<Value>> {
         for input in inputs {
             ensure!(
                 Environment::same_runtime(&self.environment, input.environment),
@@ -1499,7 +1665,7 @@ pub struct RunFuture<'a> {
 }
 
 impl Future for RunFuture<'_> {
-    type Output = Result<Vec<Value<'static>>>;
+    type Output = Result<Vec<Value>>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         assert!(!self.finished, "RunFuture polled after completion");

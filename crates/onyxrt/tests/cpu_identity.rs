@@ -1,13 +1,13 @@
 use onyxrt::{
     model::Environment,
     provider::{CudaExecutionProvider, DnnlExecutionProvider, TensorRtExecutionProvider},
-    value::{Input, MemoryInfo, Value},
+    value::{Input, MemoryInfo, Value, ValueMut},
 };
 
 #[cfg(feature = "dlpack")]
-use dlpark::allocation::dynamic;
+use dlpark::{TryFromDlpack, allocation::dynamic};
 #[cfg(feature = "dlpack")]
-use ndarray::arr1;
+use ndarray::{ArrayViewD, arr1};
 #[cfg(feature = "dlpack")]
 use onyxrt::dlpack;
 
@@ -30,10 +30,16 @@ fn cpu_value_identity_round_trip() {
 
     let memory = MemoryInfo::cpu(environment.clone()).unwrap();
     let mut data = [1.5_f32, -2.0, 7.25];
-    let value = Value::tensor(environment, &memory, &mut data, [3]).unwrap();
+    let value = ValueMut::tensor(environment.clone(), &memory, &mut data, [3]).unwrap();
     let inputs = [Input::new("x", &value).unwrap()];
     let outputs = first.run(&inputs, &["y"]).unwrap();
+    let info = outputs[0].tensor_info().unwrap();
+    assert_eq!(info.element_type(), onyxrt::model::ElementType::Float32);
+    assert_eq!(info.shape(), &[3]);
     assert_eq!(outputs[0].as_slice::<f32>().unwrap(), &[1.5, -2.0, 7.25]);
+
+    let empty = Value::allocate_tensor::<f32>(environment.clone(), [0, 6]).unwrap();
+    assert!(empty.as_slice::<f32>().unwrap().is_empty());
 }
 
 #[cfg(feature = "dlpack")]
@@ -50,10 +56,22 @@ fn cpu_dlpack_identity_round_trip() {
         Box::new(arr1(&[1.5_f32, -2.0, 7.25])).try_into().unwrap();
     // SAFETY: the ndarray adapter populated a complete owned descriptor.
     let tensor = unsafe { initialized.finish() };
-    let value = dlpack::Value::from_managed(environment, &tensor).unwrap();
-    let inputs = [Input::new("x", value.as_value()).unwrap()];
+    let value = dlpack::from_managed(environment.clone(), &tensor).unwrap();
+    let inputs = [Input::new("x", &value).unwrap()];
     let outputs = session.run(&inputs, &["y"]).unwrap();
     assert_eq!(outputs[0].as_slice::<f32>().unwrap(), &[1.5, -2.0, 7.25]);
+
+    let output = dlpack::into_managed(outputs.into_iter().next().unwrap()).unwrap();
+    // SAFETY: the owned ORT tensor remains alive in the DLPack context and the
+    // immutable view does not alias mutable access.
+    let view = unsafe { ArrayViewD::<f32>::try_from_dlpack(&output, ()) }.unwrap();
+    assert_eq!(view.as_slice().unwrap(), &[1.5, -2.0, 7.25]);
+
+    let empty = Value::allocate_tensor::<f32>(environment, [0, 6]).unwrap();
+    let empty = dlpack::into_managed(empty).unwrap();
+    let empty = empty.validate().unwrap();
+    assert_eq!(empty.shape(), &[0, 6]);
+    assert_eq!(empty.num_elements(), 0);
 }
 
 #[test]

@@ -399,9 +399,9 @@ impl DnnlExecutionProvider {
 
 /// A provider configured through ONNX Runtime's generic name/options API.
 ///
-/// C API v21 supports providers including `QNN`, `SNPE`, `XNNPACK`, `CoreML`,
-/// and `AZURE` through this entry point. CUDA, TensorRT, and OpenVINO require
-/// their dedicated builder methods instead.
+/// Providers including `QNN`, `SNPE`, `XNNPACK`, `CoreML`, and `AZURE` can use
+/// this entry point. CUDA, TensorRT, and OpenVINO use their dedicated builder
+/// methods instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedExecutionProvider {
     pub(super) name: String,
