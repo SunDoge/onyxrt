@@ -12,6 +12,9 @@ pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub(super) enum Error {
+    #[snafu(display("failed to resolve ONNX Runtime API function"))]
+    Api { source: sys::Error },
+
     #[snafu(display("ONNX Runtime error {code:?}: {message}"))]
     Runtime {
         code: sys::OrtErrorCode,
@@ -37,7 +40,9 @@ impl Drop for OutputOwner {
     fn drop(&mut self) {
         // SAFETY: this owner received the unique live OrtValue and drops it once.
         unsafe {
-            (self.environment.inner.api.table().ReleaseValue)(self.value as *mut sys::OrtValue)
+            api_function!(self.environment.inner.api, ReleaseValue)(
+                self.value as *mut sys::OrtValue,
+            )
         };
     }
 }
@@ -61,7 +66,7 @@ impl Drop for ValueGuard<'_> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             // SAFETY: a non-null guard pointer is uniquely owned and live.
-            unsafe { (self.api.table().ReleaseValue)(self.ptr) };
+            unsafe { api_function!(self.api, ReleaseValue)(self.ptr) };
         }
     }
 }
@@ -88,10 +93,11 @@ impl Drop for AllocatedBufferGuard<'_> {
             return;
         }
         // SAFETY: allocation was returned by this exact allocator and is freed once.
-        let status = unsafe { (self.api.table().AllocatorFree)(self.allocator, self.allocation) };
-        if !status.0.is_null() {
+        let status =
+            unsafe { api_function!(self.api, AllocatorFree)(self.allocator, self.allocation) };
+        if !status.is_null() {
             // SAFETY: Drop cannot report the error, but owns the status.
-            unsafe { (self.api.table().ReleaseStatus)(status.0) };
+            unsafe { api_function!(self.api, ReleaseStatus)(status) };
         }
     }
 }
@@ -99,14 +105,14 @@ impl Drop for AllocatedBufferGuard<'_> {
 impl Drop for IoBindingGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns the binding pointer.
-        unsafe { (self.api.table().ReleaseIoBinding)(self.binding) };
+        unsafe { api_function!(self.api, ReleaseIoBinding)(self.binding) };
     }
 }
 
 impl Drop for MemoryInfoGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns a live memory-info object.
-        unsafe { (self.api.table().ReleaseMemoryInfo)(self.memory_info) };
+        unsafe { api_function!(self.api, ReleaseMemoryInfo)(self.memory_info) };
     }
 }
 
@@ -141,26 +147,26 @@ pub(super) fn discard_provider_array(
 ) {
     // SAFETY: providers and count are the unmodified outputs from
     // GetAvailableProviders and this function is called exactly once.
-    let status = unsafe { (api.table().ReleaseAvailableProviders)(providers, count) };
-    if !status.0.is_null() {
+    let status = unsafe { api_function!(api, ReleaseAvailableProviders)(providers, count) };
+    if !status.is_null() {
         // ReleaseAvailableProviders is documented never to fail. Still release
         // a defensive unexpected status to avoid leaking it during Drop.
         // SAFETY: a non-null status is owned by the caller.
-        unsafe { (api.table().ReleaseStatus)(status.0) };
+        unsafe { api_function!(api, ReleaseStatus)(status) };
     }
 }
 
 impl Drop for TypeInfoGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns a live type-info object.
-        unsafe { (self.api.table().ReleaseTypeInfo)(self.type_info) };
+        unsafe { api_function!(self.api, ReleaseTypeInfo)(self.type_info) };
     }
 }
 
 impl Drop for ShapeInfoGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns a live shape-info object.
-        unsafe { (self.api.table().ReleaseTensorTypeAndShapeInfo)(self.info) };
+        unsafe { api_function!(self.api, ReleaseTensorTypeAndShapeInfo)(self.info) };
     }
 }
 
@@ -188,20 +194,18 @@ pub(super) fn default_allocator(api: &sys::Api) -> Result<*mut sys::OrtAllocator
     let mut allocator = ptr::null_mut();
     // SAFETY: allocator is writable output storage; the returned default
     // allocator has process lifetime and is not released by callers.
-    check_status(api, unsafe {
-        (api.table().GetAllocatorWithDefaultOptions)(&mut allocator)
-    })?;
+    status_call!(api, GetAllocatorWithDefaultOptions(&mut allocator))?;
     require_non_null(allocator, "default allocator")
 }
 
 pub(super) fn check_status(api: &sys::Api, status: sys::OrtStatusPtr) -> Result<()> {
-    if status.0.is_null() {
+    if status.is_null() {
         return Ok(());
     }
     // SAFETY: non-null status is owned by the caller until ReleaseStatus.
-    let code = unsafe { (api.table().GetErrorCode)(status.0) };
+    let code = unsafe { api_function!(api, GetErrorCode)(status) };
     // SAFETY: the status remains live and owns its diagnostic message.
-    let message_ptr = unsafe { (api.table().GetErrorMessage)(status.0) };
+    let message_ptr = unsafe { api_function!(api, GetErrorMessage)(status) };
     let message = if message_ptr.is_null() {
         "unknown native error".to_owned()
     } else {
@@ -211,6 +215,30 @@ pub(super) fn check_status(api: &sys::Api, status: sys::OrtStatusPtr) -> Result<
             .into_owned()
     };
     // SAFETY: all status fields have been copied and this releases it exactly once.
-    unsafe { (api.table().ReleaseStatus)(status.0) };
+    unsafe { api_function!(api, ReleaseStatus)(status) };
     Err(Error::Runtime { code, message })
 }
+
+macro_rules! api_function {
+    ($api:expr, $name:ident) => {{
+        ($api)
+            .function(($api).table().$name, stringify!($name))
+            .expect("negotiated ONNX Runtime API function is missing")
+    }};
+}
+
+macro_rules! status_call {
+    ($api:expr, $name:ident($($argument:expr),* $(,)?)) => {{
+        match ($api).function(($api).table().$name, stringify!($name)) {
+            Ok(function) => {
+                // SAFETY: this crate-private macro is used only after each
+                // invocation establishes the C function's preconditions.
+                let status = unsafe { function($($argument),*) };
+                $crate::ffi::check_status($api, status)
+            }
+            Err(source) => Err($crate::ffi::Error::Api { source }),
+        }
+    }};
+}
+
+pub(crate) use {api_function, status_call};

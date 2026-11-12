@@ -13,7 +13,8 @@ use snafu::{Snafu, ensure};
 use crate::{
     ffi::{
         self, AllocatedBufferGuard, IoBindingGuard, MemoryInfoGuard, TypeInfoGuard, ValueGuard,
-        check_status, cstring, default_allocator, require_const_non_null, require_non_null,
+        api_function, check_status, cstring, default_allocator, require_const_non_null,
+        require_non_null, status_call,
     },
     io_binding::{AsyncCompletion, IoBinding, PendingIoBindingRun, RunFuture, async_run_callback},
     model::{
@@ -241,7 +242,7 @@ impl SessionBuilder {
         // SAFETY: env, native_path, and options remain live through the call;
         // session points to writable output storage.
         let status = unsafe {
-            (api.table().CreateSession)(
+            api_function!(api, CreateSession)(
                 self.environment.inner.env as *const sys::OrtEnv,
                 native_path.as_ptr(),
                 options.options,
@@ -264,7 +265,7 @@ impl SessionBuilder {
         let mut session = ptr::null_mut();
         // SAFETY: model and options remain live through the call; env is valid.
         let status = unsafe {
-            (api.table().CreateSessionFromArray)(
+            api_function!(api, CreateSessionFromArray)(
                 self.environment.inner.env as *const sys::OrtEnv,
                 model.as_ptr().cast(),
                 model.len(),
@@ -285,35 +286,35 @@ impl SessionBuilder {
         let api = &self.environment.inner.api;
         let mut options = ptr::null_mut();
         // SAFETY: output points to writable storage.
-        check_status(api, unsafe {
-            (api.table().CreateSessionOptions)(&mut options)
-        })?;
+        status_call!(api, CreateSessionOptions(&mut options))?;
         let options = require_non_null(options, "session options")?;
         let guard = SessionOptionsGuard { api, options };
 
         // SAFETY: options is a live, uniquely configured options object.
-        check_status(api, unsafe {
-            (api.table().SetSessionGraphOptimizationLevel)(options, self.optimization.into())
-        })?;
+        status_call!(
+            api,
+            SetSessionGraphOptimizationLevel(options, self.optimization.into())
+        )?;
         // SAFETY: options is live and the execution-mode enum is valid.
-        check_status(api, unsafe {
-            (api.table().SetSessionExecutionMode)(options, self.execution_mode.into())
-        })?;
+        status_call!(
+            api,
+            SetSessionExecutionMode(options, self.execution_mode.into())
+        )?;
         // SAFETY: options is live and uniquely configured before session creation.
         let arena_status = unsafe {
             if self.cpu_provider.arena_enabled() {
-                (api.table().EnableCpuMemArena)(options)
+                api_function!(api, EnableCpuMemArena)(options)
             } else {
-                (api.table().DisableCpuMemArena)(options)
+                api_function!(api, DisableCpuMemArena)(options)
             }
         };
         check_status(api, arena_status)?;
         // SAFETY: options is live and uniquely configured before session creation.
         let memory_pattern_status = unsafe {
             if self.memory_pattern {
-                (api.table().EnableMemPattern)(options)
+                api_function!(api, EnableMemPattern)(options)
             } else {
-                (api.table().DisableMemPattern)(options)
+                api_function!(api, DisableMemPattern)(options)
             }
         };
         check_status(api, memory_pattern_status)?;
@@ -321,70 +322,53 @@ impl SessionBuilder {
             let prefix = NativeModelPath::new(prefix)?;
             // SAFETY: prefix uses ORT's platform path representation and stays
             // live through the synchronous configuration call.
-            check_status(api, unsafe {
-                (api.table().EnableProfiling)(options, prefix.as_ptr())
-            })?;
+            status_call!(api, EnableProfiling(options, prefix.as_ptr()))?;
         }
         if let Some(path) = &self.optimized_model_path {
             let path = NativeModelPath::new(path)?;
             // SAFETY: path is platform-native and live for the call.
-            check_status(api, unsafe {
-                (api.table().SetOptimizedModelFilePath)(options, path.as_ptr())
-            })?;
+            status_call!(api, SetOptimizedModelFilePath(options, path.as_ptr()))?;
         }
         if let Some(id) = &self.log_id {
             let id = cstring(id, "session log id")?;
             // SAFETY: id is NUL-terminated and live for the call.
-            check_status(api, unsafe {
-                (api.table().SetSessionLogId)(options, id.as_ptr())
-            })?;
+            status_call!(api, SetSessionLogId(options, id.as_ptr()))?;
         }
         if let Some(level) = self.log_level {
             let level: sys::OrtLoggingLevel = level.into();
             // SAFETY: the logging level is a valid ORT enum value.
-            check_status(api, unsafe {
-                (api.table().SetSessionLogSeverityLevel)(options, level.0 as i32)
-            })?;
+            status_call!(api, SetSessionLogSeverityLevel(options, level.0 as i32))?;
         }
         if let Some(verbosity) = self.log_verbosity {
             // SAFETY: options is live and uniquely configured.
-            check_status(api, unsafe {
-                (api.table().SetSessionLogVerbosityLevel)(options, verbosity)
-            })?;
+            status_call!(api, SetSessionLogVerbosityLevel(options, verbosity))?;
         }
         if let Some(enabled) = self.deterministic_compute {
             // SAFETY: options is live and uniquely configured.
-            check_status(api, unsafe {
-                (api.table().SetDeterministicCompute)(options, enabled)
-            })?;
+            status_call!(api, SetDeterministicCompute(options, enabled))?;
         }
         for (key, value) in &self.config_entries {
             let key = cstring(key, "session configuration key")?;
             let value = cstring(value, "session configuration value")?;
             // SAFETY: both strings are NUL-terminated and live for the call.
-            check_status(api, unsafe {
-                (api.table().AddSessionConfigEntry)(options, key.as_ptr(), value.as_ptr())
-            })?;
+            status_call!(
+                api,
+                AddSessionConfigEntry(options, key.as_ptr(), value.as_ptr())
+            )?;
         }
         for path in &self.custom_ops_libraries {
             let path = NativeModelPath::new(path)?;
             // SAFETY: path uses ORT's native representation and remains live
             // through the synchronous registration call.
-            check_status(api, unsafe {
-                (api.table().RegisterCustomOpsLibrary_V2)(options, path.as_ptr())
-            })?;
+            status_call!(api, RegisterCustomOpsLibrary_V2(options, path.as_ptr()))?;
         }
         if let Some(threads) = self.intra_threads {
             // SAFETY: options remains valid and uniquely borrowed here.
-            check_status(api, unsafe {
-                (api.table().SetIntraOpNumThreads)(options, threads)
-            })?;
+            status_call!(api, SetIntraOpNumThreads(options, threads))?;
         }
         if let Some(threads) = self.inter_threads {
             // SAFETY: options remains valid and uniquely borrowed here.
-            check_status(api, unsafe {
-                (api.table().SetInterOpNumThreads)(options, threads)
-            })?;
+            status_call!(api, SetInterOpNumThreads(options, threads))?;
         }
 
         for provider in &self.execution_providers {
@@ -415,27 +399,27 @@ pub(super) fn append_cuda_provider(
     let encoded = provider.options.encode("CUDA provider option")?;
     let mut options = ptr::null_mut();
     // SAFETY: output points to writable storage owned by the guard below.
-    check_status(api, unsafe {
-        (api.table().CreateCUDAProviderOptions)(&mut options)
-    })?;
+    status_call!(api, CreateCUDAProviderOptions(&mut options))?;
     let options = require_non_null(options, "CUDA provider options")?;
     let guard = CudaProviderOptionsGuard { api, options };
     if encoded.len() != 0 {
         // SAFETY: the key/value pointer arrays have matching lengths and all
         // C strings remain live through the synchronous call.
-        check_status(api, unsafe {
-            (api.table().UpdateCUDAProviderOptions)(
+        status_call!(
+            api,
+            UpdateCUDAProviderOptions(
                 options,
                 encoded.key_pointers.as_ptr(),
                 encoded.value_pointers.as_ptr(),
                 encoded.len(),
             )
-        })?;
+        )?;
     }
     // SAFETY: both option objects are live for the duration of the call.
-    check_status(api, unsafe {
-        (api.table().SessionOptionsAppendExecutionProvider_CUDA_V2)(session_options, options)
-    })?;
+    status_call!(
+        api,
+        SessionOptionsAppendExecutionProvider_CUDA_V2(session_options, options)
+    )?;
     drop(guard);
     Ok(())
 }
@@ -448,28 +432,27 @@ pub(super) fn append_tensorrt_provider(
     let encoded = provider.options.encode("TensorRT provider option")?;
     let mut options = ptr::null_mut();
     // SAFETY: output points to writable storage owned by the guard below.
-    check_status(api, unsafe {
-        (api.table().CreateTensorRTProviderOptions)(&mut options)
-    })?;
+    status_call!(api, CreateTensorRTProviderOptions(&mut options))?;
     let options = require_non_null(options, "TensorRT provider options")?;
     let guard = TensorRtProviderOptionsGuard { api, options };
     if encoded.len() != 0 {
         // SAFETY: the key/value pointer arrays have matching lengths and all
         // C strings remain live through the synchronous call.
-        check_status(api, unsafe {
-            (api.table().UpdateTensorRTProviderOptions)(
+        status_call!(
+            api,
+            UpdateTensorRTProviderOptions(
                 options,
                 encoded.key_pointers.as_ptr(),
                 encoded.value_pointers.as_ptr(),
                 encoded.len(),
             )
-        })?;
+        )?;
     }
     // SAFETY: both option objects are live for the duration of the call.
-    check_status(api, unsafe {
-        (api.table()
-            .SessionOptionsAppendExecutionProvider_TensorRT_V2)(session_options, options)
-    })?;
+    status_call!(
+        api,
+        SessionOptionsAppendExecutionProvider_TensorRT_V2(session_options, options,)
+    )?;
     drop(guard);
     Ok(())
 }
@@ -482,15 +465,15 @@ pub(super) fn append_openvino_provider(
     let encoded = provider.options.encode("OpenVINO provider option")?;
     // SAFETY: the key/value pointer arrays have matching lengths and all C
     // strings remain live through the synchronous call.
-    check_status(api, unsafe {
-        (api.table()
-            .SessionOptionsAppendExecutionProvider_OpenVINO_V2)(
+    status_call!(
+        api,
+        SessionOptionsAppendExecutionProvider_OpenVINO_V2(
             session_options,
             encoded.key_pointers.as_ptr(),
             encoded.value_pointers.as_ptr(),
             encoded.len(),
         )
-    })?;
+    )?;
     Ok(())
 }
 
@@ -502,27 +485,27 @@ pub(super) fn append_dnnl_provider(
     let encoded = provider.options.encode("oneDNN provider option")?;
     let mut options = ptr::null_mut();
     // SAFETY: output points to writable storage owned by the guard below.
-    check_status(api, unsafe {
-        (api.table().CreateDnnlProviderOptions)(&mut options)
-    })?;
+    status_call!(api, CreateDnnlProviderOptions(&mut options))?;
     let options = require_non_null(options, "oneDNN provider options")?;
     let guard = DnnlProviderOptionsGuard { api, options };
     if encoded.len() != 0 {
         // SAFETY: the key/value pointer arrays have matching lengths and all
         // C strings remain live through the synchronous call.
-        check_status(api, unsafe {
-            (api.table().UpdateDnnlProviderOptions)(
+        status_call!(
+            api,
+            UpdateDnnlProviderOptions(
                 options,
                 encoded.key_pointers.as_ptr(),
                 encoded.value_pointers.as_ptr(),
                 encoded.len(),
             )
-        })?;
+        )?;
     }
     // SAFETY: both option objects are live for the duration of the call.
-    check_status(api, unsafe {
-        (api.table().SessionOptionsAppendExecutionProvider_Dnnl)(session_options, options)
-    })?;
+    status_call!(
+        api,
+        SessionOptionsAppendExecutionProvider_Dnnl(session_options, options)
+    )?;
     drop(guard);
     Ok(())
 }
@@ -536,15 +519,16 @@ pub(super) fn append_named_provider(
     let encoded = provider.options.encode("execution provider option")?;
     // SAFETY: provider name, key/value arrays, and their C strings remain live
     // through the synchronous call.
-    check_status(api, unsafe {
-        (api.table().SessionOptionsAppendExecutionProvider)(
+    status_call!(
+        api,
+        SessionOptionsAppendExecutionProvider(
             session_options,
             name.as_ptr(),
             encoded.key_pointers.as_ptr(),
             encoded.value_pointers.as_ptr(),
             encoded.len(),
         )
-    })?;
+    )?;
     Ok(())
 }
 
@@ -557,7 +541,7 @@ impl Drop for SessionOptionsGuard<'_> {
     fn drop(&mut self) {
         if !self.options.is_null() {
             // SAFETY: this guard uniquely owns the options pointer.
-            unsafe { (self.api.table().ReleaseSessionOptions)(self.options) };
+            unsafe { api_function!(self.api, ReleaseSessionOptions)(self.options) };
         }
     }
 }
@@ -570,7 +554,7 @@ pub(super) struct CudaProviderOptionsGuard<'a> {
 impl Drop for CudaProviderOptionsGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns the options pointer.
-        unsafe { (self.api.table().ReleaseCUDAProviderOptions)(self.options) };
+        unsafe { api_function!(self.api, ReleaseCUDAProviderOptions)(self.options) };
     }
 }
 
@@ -587,14 +571,14 @@ pub(super) struct DnnlProviderOptionsGuard<'a> {
 impl Drop for DnnlProviderOptionsGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns the options pointer.
-        unsafe { (self.api.table().ReleaseDnnlProviderOptions)(self.options) };
+        unsafe { api_function!(self.api, ReleaseDnnlProviderOptions)(self.options) };
     }
 }
 
 impl Drop for TensorRtProviderOptionsGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns the options pointer.
-        unsafe { (self.api.table().ReleaseTensorRTProviderOptions)(self.options) };
+        unsafe { api_function!(self.api, ReleaseTensorRTProviderOptions)(self.options) };
     }
 }
 
@@ -621,9 +605,7 @@ impl RunOptions {
         let api = &environment.inner.api;
         let mut run_options = ptr::null_mut();
         // SAFETY: output points to writable storage.
-        check_status(api, unsafe {
-            (api.table().CreateRunOptions)(&mut run_options)
-        })?;
+        status_call!(api, CreateRunOptions(&mut run_options))?;
         let run_options = require_non_null(run_options, "run options")?;
         Ok(Self {
             environment,
@@ -636,9 +618,7 @@ impl RunOptions {
         let tag = cstring(tag, "run tag")?;
         let api = &self.environment.inner.api;
         // SAFETY: the options are live and tag is NUL-terminated for the call.
-        check_status(api, unsafe {
-            (api.table().RunOptionsSetRunTag)(self.as_mut_ptr(), tag.as_ptr())
-        })?;
+        status_call!(api, RunOptionsSetRunTag(self.as_mut_ptr(), tag.as_ptr()))?;
         Ok(self)
     }
 
@@ -647,9 +627,10 @@ impl RunOptions {
         let level: sys::OrtLoggingLevel = level.into();
         let api = &self.environment.inner.api;
         // SAFETY: the options are live and the logging enum value is valid.
-        check_status(api, unsafe {
-            (api.table().RunOptionsSetRunLogSeverityLevel)(self.as_mut_ptr(), level.0 as i32)
-        })?;
+        status_call!(
+            api,
+            RunOptionsSetRunLogSeverityLevel(self.as_mut_ptr(), level.0 as i32)
+        )?;
         Ok(self)
     }
 
@@ -657,9 +638,10 @@ impl RunOptions {
     pub fn set_log_verbosity(&mut self, verbosity: i32) -> Result<&mut Self> {
         let api = &self.environment.inner.api;
         // SAFETY: the options are live and uniquely configured through &mut self.
-        check_status(api, unsafe {
-            (api.table().RunOptionsSetRunLogVerbosityLevel)(self.as_mut_ptr(), verbosity)
-        })?;
+        status_call!(
+            api,
+            RunOptionsSetRunLogVerbosityLevel(self.as_mut_ptr(), verbosity)
+        )?;
         Ok(self)
     }
 
@@ -669,9 +651,10 @@ impl RunOptions {
         let value = cstring(value, "run configuration value")?;
         let api = &self.environment.inner.api;
         // SAFETY: options and both NUL-terminated strings are live for the call.
-        check_status(api, unsafe {
-            (api.table().AddRunConfigEntry)(self.as_mut_ptr(), key.as_ptr(), value.as_ptr())
-        })?;
+        status_call!(
+            api,
+            AddRunConfigEntry(self.as_mut_ptr(), key.as_ptr(), value.as_ptr())
+        )?;
         Ok(self)
     }
 
@@ -679,9 +662,7 @@ impl RunOptions {
     pub fn terminate(&self) -> Result<()> {
         let api = &self.environment.inner.api;
         // SAFETY: ORT permits termination to be requested while a run is active.
-        check_status(api, unsafe {
-            (api.table().RunOptionsSetTerminate)(self.as_mut_ptr())
-        })?;
+        status_call!(api, RunOptionsSetTerminate(self.as_mut_ptr()))?;
         Ok(())
     }
 
@@ -689,9 +670,7 @@ impl RunOptions {
     pub fn reset_terminate(&self) -> Result<()> {
         let api = &self.environment.inner.api;
         // SAFETY: the options are live and ORT synchronizes its terminate state.
-        check_status(api, unsafe {
-            (api.table().RunOptionsUnsetTerminate)(self.as_mut_ptr())
-        })?;
+        status_call!(api, RunOptionsUnsetTerminate(self.as_mut_ptr()))?;
         Ok(())
     }
 
@@ -704,7 +683,8 @@ impl RunOptions {
         Arc::ptr_eq(&self.environment.inner, &session.environment.inner)
     }
 
-    pub(super) fn as_ptr(&self) -> *const sys::OrtRunOptions {
+    /// Returns the borrowed native run-options pointer.
+    pub fn as_ptr(&self) -> *const sys::OrtRunOptions {
         self.run_options as *const sys::OrtRunOptions
     }
 
@@ -716,7 +696,7 @@ impl RunOptions {
 impl Drop for RunOptions {
     fn drop(&mut self) {
         // SAFETY: this object uniquely owns the live options pointer.
-        unsafe { (self.environment.inner.api.table().ReleaseRunOptions)(self.as_mut_ptr()) };
+        unsafe { api_function!(self.environment.inner.api, ReleaseRunOptions)(self.as_mut_ptr()) };
     }
 }
 
@@ -736,7 +716,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         // SAFETY: session was created by this environment and is released once.
         unsafe {
-            (self.environment.inner.api.table().ReleaseSession)(
+            api_function!(self.environment.inner.api, ReleaseSession)(
                 self.session as *mut sys::OrtSession,
             )
         };
@@ -754,9 +734,10 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut binding = ptr::null_mut();
         // SAFETY: the session is live and binding is writable output storage.
-        check_status(api, unsafe {
-            (api.table().CreateIoBinding)(self.session as *mut sys::OrtSession, &mut binding)
-        })?;
+        status_call!(
+            api,
+            CreateIoBinding(self.session as *mut sys::OrtSession, &mut binding)
+        )?;
         Ok(IoBinding {
             session: self,
             binding: require_non_null(binding, "I/O binding")?,
@@ -801,12 +782,10 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut metadata = ptr::null_mut();
         // SAFETY: the session is live and metadata is writable output storage.
-        check_status(api, unsafe {
-            (api.table().SessionGetModelMetadata)(
-                self.session as *const sys::OrtSession,
-                &mut metadata,
-            )
-        })?;
+        status_call!(
+            api,
+            SessionGetModelMetadata(self.session as *const sys::OrtSession, &mut metadata,)
+        )?;
         Ok(ModelMetadata {
             environment: self.environment.clone(),
             metadata: require_non_null(metadata, "model metadata")? as usize,
@@ -818,12 +797,10 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut timestamp = 0;
         // SAFETY: the session is live and timestamp is writable output storage.
-        check_status(api, unsafe {
-            (api.table().SessionGetProfilingStartTimeNs)(
-                self.session as *const sys::OrtSession,
-                &mut timestamp,
-            )
-        })?;
+        status_call!(
+            api,
+            SessionGetProfilingStartTimeNs(self.session as *const sys::OrtSession, &mut timestamp,)
+        )?;
         Ok(timestamp)
     }
 
@@ -836,13 +813,10 @@ impl Session {
         let mut path = ptr::null_mut();
         // SAFETY: the session is exclusively borrowed, allocator is live, and
         // path is writable output storage.
-        check_status(api, unsafe {
-            (api.table().SessionEndProfiling)(
-                self.session as *mut sys::OrtSession,
-                allocator,
-                &mut path,
-            )
-        })?;
+        status_call!(
+            api,
+            SessionEndProfiling(self.session as *mut sys::OrtSession, allocator, &mut path,)
+        )?;
         let path = require_non_null(path, "profile output path")?;
         let guard = AllocatedBufferGuard {
             api,
@@ -924,13 +898,14 @@ impl Session {
 
         let mut memory_info = ptr::null_mut();
         // SAFETY: output storage is writable and enum values are valid.
-        check_status(api, unsafe {
-            (api.table().CreateCpuMemoryInfo)(
+        status_call!(
+            api,
+            CreateCpuMemoryInfo(
                 sys::OrtAllocatorType::OrtArenaAllocator,
                 sys::OrtMemType::OrtMemTypeDefault,
                 &mut memory_info,
             )
-        })?;
+        )?;
         let memory_info = require_non_null(memory_info, "CPU memory info")?;
         let memory_guard = MemoryInfoGuard { api, memory_info };
 
@@ -943,8 +918,9 @@ impl Session {
             let bytes = unsafe { input.tensor.cpu_bytes() }
                 .map_err(|source| Error::DlpackTensor { source })?;
             // SAFETY: data, shape, and memory info remain live until callback.
-            check_status(api, unsafe {
-                (api.table().CreateTensorWithDataAsOrtValue)(
+            status_call!(
+                api,
+                CreateTensorWithDataAsOrtValue(
                     memory_info,
                     bytes.as_ptr().cast_mut().cast(),
                     bytes.len(),
@@ -953,7 +929,7 @@ impl Session {
                     dlpack_to_onnx(input.tensor.dtype())?,
                     &mut value,
                 )
-            })?;
+            )?;
             input_values.push(ValueGuard::new(
                 api,
                 require_non_null(value, "async input value")?,
@@ -1001,7 +977,7 @@ impl Session {
         // the Future. callback_state is one strong Arc reference reclaimed by
         // async_run_callback. Drop waits if the Future is cancelled.
         let status = unsafe {
-            (api.table().RunAsync)(
+            api_function!(api, RunAsync)(
                 self.session as *mut sys::OrtSession,
                 future.run_options.as_ptr(),
                 future.input_name_ptrs.as_ptr(),
@@ -1014,7 +990,7 @@ impl Session {
                 callback_state.cast_mut().cast(),
             )
         };
-        if !status.0.is_null() {
+        if !status.is_null() {
             // SAFETY: submission failed, so ORT did not take ownership of the
             // callback reference and will not invoke the callback.
             unsafe { drop(Arc::from_raw(callback_state)) };
@@ -1057,13 +1033,14 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut memory_info = ptr::null_mut();
         // SAFETY: output storage is writable and enum values are valid.
-        check_status(api, unsafe {
-            (api.table().CreateCpuMemoryInfo)(
+        status_call!(
+            api,
+            CreateCpuMemoryInfo(
                 sys::OrtAllocatorType::OrtArenaAllocator,
                 sys::OrtMemType::OrtMemTypeDefault,
                 &mut memory_info,
             )
-        })?;
+        )?;
         let memory_info = require_non_null(memory_info, "CPU memory info")?;
         let _memory_guard = MemoryInfoGuard { api, memory_info };
         let allocator = default_allocator(api)?;
@@ -1106,7 +1083,7 @@ impl Session {
         // SAFETY: all pointer arrays have matching lengths and all values stay
         // live for the synchronous native run.
         let status = unsafe {
-            (api.table().Run)(
+            api_function!(api, Run)(
                 self.session as *mut sys::OrtSession,
                 options.map_or(ptr::null(), RunOptions::as_ptr),
                 input_name_ptrs.as_ptr(),
@@ -1120,14 +1097,14 @@ impl Session {
         if let Err(error) = check_status(api, status) {
             for value in output_values.into_iter().filter(|value| !value.is_null()) {
                 // SAFETY: ORT initialized this caller-owned output.
-                unsafe { (api.table().ReleaseValue)(value) };
+                unsafe { api_function!(api, ReleaseValue)(value) };
             }
             return Err(error.into());
         }
         if output_values.iter().any(|value| value.is_null()) {
             for value in output_values.into_iter().filter(|value| !value.is_null()) {
                 // SAFETY: every non-null output is owned by this call.
-                unsafe { (api.table().ReleaseValue)(value) };
+                unsafe { api_function!(api, ReleaseValue)(value) };
             }
             return Err(Error::NullPointer {
                 what: "output value",
@@ -1179,13 +1156,14 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut memory_info = ptr::null_mut();
         // SAFETY: output storage is writable and enum values are valid.
-        check_status(api, unsafe {
-            (api.table().CreateCpuMemoryInfo)(
+        status_call!(
+            api,
+            CreateCpuMemoryInfo(
                 sys::OrtAllocatorType::OrtArenaAllocator,
                 sys::OrtMemType::OrtMemTypeDefault,
                 &mut memory_info,
             )
-        })?;
+        )?;
         let memory_info = require_non_null(memory_info, "CPU memory info")?;
         let memory_guard = MemoryInfoGuard { api, memory_info };
 
@@ -1202,8 +1180,9 @@ impl Session {
             // data and shape remain live for the duration of this Run call.
             // ORT treats Run inputs as const despite the legacy creation API's
             // mutable pointer parameter.
-            check_status(api, unsafe {
-                (api.table().CreateTensorWithDataAsOrtValue)(
+            status_call!(
+                api,
+                CreateTensorWithDataAsOrtValue(
                     memory_info,
                     bytes.as_ptr().cast_mut().cast(),
                     bytes.len(),
@@ -1212,7 +1191,7 @@ impl Session {
                     dlpack_to_onnx(input.tensor.dtype())?,
                     &mut value,
                 )
-            })?;
+            )?;
             input_values.push(ValueGuard::new(
                 api,
                 require_non_null(value, "input value")?,
@@ -1240,7 +1219,7 @@ impl Session {
         // SAFETY: all name/value pointer arrays have matching lengths and stay
         // live through the synchronous call; output storage is writable.
         let status = unsafe {
-            (api.table().Run)(
+            api_function!(api, Run)(
                 self.session as *mut sys::OrtSession,
                 options.map_or(ptr::null(), RunOptions::as_ptr),
                 input_name_ptrs.as_ptr(),
@@ -1254,7 +1233,7 @@ impl Session {
         if let Err(error) = check_status(api, status) {
             for value in output_values.into_iter().filter(|value| !value.is_null()) {
                 // SAFETY: ORT initialized this output and ownership was not transferred.
-                unsafe { (api.table().ReleaseValue)(value) };
+                unsafe { api_function!(api, ReleaseValue)(value) };
             }
             return Err(error.into());
         }
@@ -1263,7 +1242,7 @@ impl Session {
         if output_values.iter().any(|value| value.is_null()) {
             for value in output_values.into_iter().filter(|value| !value.is_null()) {
                 // SAFETY: every non-null entry is an owned ORT output.
-                unsafe { (api.table().ReleaseValue)(value) };
+                unsafe { api_function!(api, ReleaseValue)(value) };
             }
             return Err(Error::NullPointer {
                 what: "output value",
@@ -1315,13 +1294,14 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut memory_info = ptr::null_mut();
         // SAFETY: output storage is writable and enum values are valid.
-        check_status(api, unsafe {
-            (api.table().CreateCpuMemoryInfo)(
+        status_call!(
+            api,
+            CreateCpuMemoryInfo(
                 sys::OrtAllocatorType::OrtArenaAllocator,
                 sys::OrtMemType::OrtMemTypeDefault,
                 &mut memory_info,
             )
-        })?;
+        )?;
         let memory_info = require_non_null(memory_info, "CPU memory info")?;
         let _memory_guard = MemoryInfoGuard { api, memory_info };
 
@@ -1334,8 +1314,9 @@ impl Session {
             let bytes = unsafe { input.tensor.cpu_bytes() }
                 .map_err(|source| Error::DlpackTensor { source })?;
             // SAFETY: ORT treats input tensors as const during Run.
-            check_status(api, unsafe {
-                (api.table().CreateTensorWithDataAsOrtValue)(
+            status_call!(
+                api,
+                CreateTensorWithDataAsOrtValue(
                     memory_info,
                     bytes.as_ptr().cast_mut().cast(),
                     bytes.len(),
@@ -1344,7 +1325,7 @@ impl Session {
                     dlpack_to_onnx(input.tensor.dtype())?,
                     &mut value,
                 )
-            })?;
+            )?;
             input_values.push(ValueGuard::new(
                 api,
                 require_non_null(value, "input value")?,
@@ -1362,8 +1343,9 @@ impl Session {
                 .map_err(|source| Error::DlpackTensor { source })?;
             // SAFETY: the mutable byte storage, shape, and memory info remain
             // live until Run completes; the OrtValue does not own the bytes.
-            check_status(api, unsafe {
-                (api.table().CreateTensorWithDataAsOrtValue)(
+            status_call!(
+                api,
+                CreateTensorWithDataAsOrtValue(
                     memory_info,
                     bytes.as_mut_ptr().cast(),
                     bytes.len(),
@@ -1372,7 +1354,7 @@ impl Session {
                     dlpack_to_onnx(dtype)?,
                     &mut value,
                 )
-            })?;
+            )?;
             output_values.push(ValueGuard::new(
                 api,
                 require_non_null(value, "preallocated output value")?,
@@ -1399,7 +1381,7 @@ impl Session {
         // SAFETY: pointer arrays and all external data buffers remain live and
         // have matching lengths through this synchronous call.
         let status = unsafe {
-            (api.table().Run)(
+            api_function!(api, Run)(
                 self.session as *mut sys::OrtSession,
                 options.map_or(ptr::null(), RunOptions::as_ptr),
                 input_name_ptrs.as_ptr(),
@@ -1421,7 +1403,7 @@ impl Session {
                 if !returned.is_null() {
                     // SAFETY: a different non-null pointer was newly returned
                     // by ORT and is not owned by the original guard.
-                    unsafe { (api.table().ReleaseValue)(returned) };
+                    unsafe { api_function!(api, ReleaseValue)(returned) };
                 }
                 replaced.get_or_insert_with(|| output.name.to_string_lossy().into_owned());
             }
@@ -1469,9 +1451,10 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut binding = ptr::null_mut();
         // SAFETY: the session is live and binding is writable output storage.
-        check_status(api, unsafe {
-            (api.table().CreateIoBinding)(self.session as *mut sys::OrtSession, &mut binding)
-        })?;
+        status_call!(
+            api,
+            CreateIoBinding(self.session as *mut sys::OrtSession, &mut binding)
+        )?;
         let binding = require_non_null(binding, "I/O binding")?;
         let binding_guard = IoBindingGuard { api, binding };
 
@@ -1485,9 +1468,10 @@ impl Session {
             let value_guard = ValueGuard::new(api, value);
             // SAFETY: binding, name, and value are live. The input value and
             // its external DLPack allocation remain live through the run.
-            check_status(api, unsafe {
-                (api.table().BindInput)(binding, input.name.as_ptr(), value.cast_const())
-            })?;
+            status_call!(
+                api,
+                BindInput(binding, input.name.as_ptr(), value.cast_const())
+            )?;
             memory_infos.push(memory_guard);
             values.push(value_guard);
         }
@@ -1499,32 +1483,30 @@ impl Session {
             let value_guard = ValueGuard::new(api, value);
             // SAFETY: binding, name, and value are live. IoBindingOutput keeps
             // exclusive access to the external allocation through the run.
-            check_status(api, unsafe {
-                (api.table().BindOutput)(binding, output.name.as_ptr(), value.cast_const())
-            })?;
+            status_call!(
+                api,
+                BindOutput(binding, output.name.as_ptr(), value.cast_const())
+            )?;
             memory_infos.push(memory_guard);
             values.push(value_guard);
         }
 
         // SAFETY: binding owns valid bound values and the provider may use this
         // call to synchronize a producer stream before inference.
-        check_status(api, unsafe {
-            (api.table().SynchronizeBoundInputs)(binding)
-        })?;
+        status_call!(api, SynchronizeBoundInputs(binding))?;
         // SAFETY: the session, binding, OrtValues, and all external buffers
         // remain live for the synchronous run.
-        check_status(api, unsafe {
-            (api.table().RunWithBinding)(
+        status_call!(
+            api,
+            RunWithBinding(
                 self.session as *mut sys::OrtSession,
                 options.map_or(ptr::null(), RunOptions::as_ptr),
                 binding,
             )
-        })?;
+        )?;
         // SAFETY: binding remains live and this blocks until provider writes to
         // the bound output buffers have completed.
-        check_status(api, unsafe {
-            (api.table().SynchronizeBoundOutputs)(binding)
-        })?;
+        status_call!(api, SynchronizeBoundOutputs(binding))?;
 
         // Release the binding while every OrtValue and MemoryInfo it references
         // is still alive.
@@ -1568,9 +1550,10 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut binding = ptr::null_mut();
         // SAFETY: the session is live and binding is writable output storage.
-        check_status(api, unsafe {
-            (api.table().CreateIoBinding)(self.session as *mut sys::OrtSession, &mut binding)
-        })?;
+        status_call!(
+            api,
+            CreateIoBinding(self.session as *mut sys::OrtSession, &mut binding)
+        )?;
         let binding = require_non_null(binding, "dynamic-output I/O binding")?;
         let binding_guard = IoBindingGuard { api, binding };
         let mut memory_infos = Vec::with_capacity(inputs.len() + outputs.len());
@@ -1582,9 +1565,10 @@ impl Session {
             let value = create_external_tensor(api, memory_info, &input.tensor)?;
             let value_guard = ValueGuard::new(api, value);
             // SAFETY: all input objects remain live through the bound run.
-            check_status(api, unsafe {
-                (api.table().BindInput)(binding, input.name.as_ptr(), value.cast_const())
-            })?;
+            status_call!(
+                api,
+                BindInput(binding, input.name.as_ptr(), value.cast_const())
+            )?;
             memory_infos.push(memory_guard);
             input_values.push(value_guard);
         }
@@ -1593,47 +1577,39 @@ impl Session {
             let memory_guard = MemoryInfoGuard { api, memory_info };
             // SAFETY: binding, name, and memory info are live. ORT allocates an
             // output with the runtime shape on the requested device.
-            check_status(api, unsafe {
-                (api.table().BindOutputToDevice)(binding, output.name.as_ptr(), memory_info)
-            })?;
+            status_call!(
+                api,
+                BindOutputToDevice(binding, output.name.as_ptr(), memory_info)
+            )?;
             memory_infos.push(memory_guard);
         }
 
         // SAFETY: provider-specific synchronization makes bound inputs visible.
-        check_status(api, unsafe {
-            (api.table().SynchronizeBoundInputs)(binding)
-        })?;
+        status_call!(api, SynchronizeBoundInputs(binding))?;
         // SAFETY: all binding resources remain live through the run.
-        check_status(api, unsafe {
-            (api.table().RunWithBinding)(
+        status_call!(
+            api,
+            RunWithBinding(
                 self.session as *mut sys::OrtSession,
                 options.map_or(ptr::null(), RunOptions::as_ptr),
                 binding,
             )
-        })?;
+        )?;
         // SAFETY: wait until device output allocations are ready for consumers.
-        check_status(api, unsafe {
-            (api.table().SynchronizeBoundOutputs)(binding)
-        })?;
+        status_call!(api, SynchronizeBoundOutputs(binding))?;
 
         let mut allocator = ptr::null_mut();
         // SAFETY: allocator is writable output storage; the default allocator
         // has process lifetime and is not released by callers.
-        check_status(api, unsafe {
-            (api.table().GetAllocatorWithDefaultOptions)(&mut allocator)
-        })?;
+        status_call!(api, GetAllocatorWithDefaultOptions(&mut allocator))?;
         let allocator = require_non_null(allocator, "default allocator")?;
         let mut raw_values = ptr::null_mut();
         let mut value_count = 0;
         // SAFETY: all output pointers are writable and binding is live.
-        check_status(api, unsafe {
-            (api.table().GetBoundOutputValues)(
-                binding,
-                allocator,
-                &mut raw_values,
-                &mut value_count,
-            )
-        })?;
+        status_call!(
+            api,
+            GetBoundOutputValues(binding, allocator, &mut raw_values, &mut value_count,)
+        )?;
         let allocation_guard = AllocatedBufferGuard {
             api,
             allocator,
@@ -1651,7 +1627,7 @@ impl Session {
         if value_count != outputs.len() {
             for value in raw_values.into_iter().filter(|value| !value.is_null()) {
                 // SAFETY: each returned output is owned by the caller.
-                unsafe { (api.table().ReleaseValue)(value) };
+                unsafe { api_function!(api, ReleaseValue)(value) };
             }
             return Err(Error::BoundOutputCount {
                 expected: outputs.len(),
@@ -1661,7 +1637,7 @@ impl Session {
         if raw_values.iter().any(|value| value.is_null()) {
             for value in raw_values.into_iter().filter(|value| !value.is_null()) {
                 // SAFETY: each non-null returned output is caller-owned.
-                unsafe { (api.table().ReleaseValue)(value) };
+                unsafe { api_function!(api, ReleaseValue)(value) };
             }
             return Err(Error::NullPointer {
                 what: "bound output value",
@@ -1718,9 +1694,10 @@ impl Session {
         let api = &self.environment.inner.api;
         let mut binding = ptr::null_mut();
         // SAFETY: the session is live and binding is writable output storage.
-        check_status(api, unsafe {
-            (api.table().CreateIoBinding)(self.session as *mut sys::OrtSession, &mut binding)
-        })?;
+        status_call!(
+            api,
+            CreateIoBinding(self.session as *mut sys::OrtSession, &mut binding)
+        )?;
         let binding = require_non_null(binding, "async I/O binding")?;
         let binding_guard = IoBindingGuard { api, binding };
         let mut memory_infos = Vec::with_capacity(inputs.len() + outputs.len());
@@ -1733,9 +1710,10 @@ impl Session {
             let value_guard = ValueGuard::new(api, value);
             // SAFETY: all bound objects and external storage are retained by
             // the pending guard until synchronization.
-            check_status(api, unsafe {
-                (api.table().BindInput)(binding, input.name.as_ptr(), value.cast_const())
-            })?;
+            status_call!(
+                api,
+                BindInput(binding, input.name.as_ptr(), value.cast_const())
+            )?;
             memory_infos.push(memory_guard);
             values.push(value_guard);
         }
@@ -1746,29 +1724,29 @@ impl Session {
             let value_guard = ValueGuard::new(api, value);
             // SAFETY: the pending guard retains exclusive output storage and
             // every native object until provider synchronization completes.
-            check_status(api, unsafe {
-                (api.table().BindOutput)(binding, output.name.as_ptr(), value.cast_const())
-            })?;
+            status_call!(
+                api,
+                BindOutput(binding, output.name.as_ptr(), value.cast_const())
+            )?;
             memory_infos.push(memory_guard);
             values.push(value_guard);
         }
 
         // SAFETY: binding is live; provider-specific synchronization makes
         // producer work visible before inference starts.
-        check_status(api, unsafe {
-            (api.table().SynchronizeBoundInputs)(binding)
-        })?;
+        status_call!(api, SynchronizeBoundInputs(binding))?;
 
         options.add_config_entry("disable_synchronize_execution_providers", "1")?;
         // SAFETY: all bindings and external buffers remain live in the guard
         // returned below. This call submits work without the final EP sync.
-        check_status(api, unsafe {
-            (api.table().RunWithBinding)(
+        status_call!(
+            api,
+            RunWithBinding(
                 self.session as *mut sys::OrtSession,
                 options.as_ptr(),
                 binding,
             )
-        })?;
+        )?;
 
         Ok(PendingIoBindingRun {
             session: self,
@@ -1803,10 +1781,10 @@ impl Session {
         // SAFETY: session is live and count is writable output storage.
         let status = unsafe {
             match kind {
-                IoKind::Input => (api.table().SessionGetInputCount)(session, &mut count),
-                IoKind::Output => (api.table().SessionGetOutputCount)(session, &mut count),
+                IoKind::Input => api_function!(api, SessionGetInputCount)(session, &mut count),
+                IoKind::Output => api_function!(api, SessionGetOutputCount)(session, &mut count),
                 IoKind::Initializer => {
-                    (api.table().SessionGetOverridableInitializerCount)(session, &mut count)
+                    api_function!(api, SessionGetOverridableInitializerCount)(session, &mut count)
                 }
             }
         };
@@ -1815,9 +1793,7 @@ impl Session {
         let mut allocator = ptr::null_mut();
         // SAFETY: allocator is writable output storage; the returned default
         // allocator has process lifetime and must not be released by callers.
-        check_status(api, unsafe {
-            (api.table().GetAllocatorWithDefaultOptions)(&mut allocator)
-        })?;
+        status_call!(api, GetAllocatorWithDefaultOptions(&mut allocator))?;
         let allocator = require_non_null(allocator, "default allocator")?;
 
         (0..count)
@@ -1837,13 +1813,19 @@ impl Session {
         // SAFETY: session and allocator are live; raw_name is writable output storage.
         let status = unsafe {
             match kind {
-                IoKind::Input => {
-                    (api.table().SessionGetInputName)(session, index, allocator, &mut raw_name)
-                }
-                IoKind::Output => {
-                    (api.table().SessionGetOutputName)(session, index, allocator, &mut raw_name)
-                }
-                IoKind::Initializer => (api.table().SessionGetOverridableInitializerName)(
+                IoKind::Input => api_function!(api, SessionGetInputName)(
+                    session,
+                    index,
+                    allocator,
+                    &mut raw_name,
+                ),
+                IoKind::Output => api_function!(api, SessionGetOutputName)(
+                    session,
+                    index,
+                    allocator,
+                    &mut raw_name,
+                ),
+                IoKind::Initializer => api_function!(api, SessionGetOverridableInitializerName)(
                     session,
                     index,
                     allocator,
@@ -1858,27 +1840,25 @@ impl Session {
             .to_string_lossy()
             .into_owned();
         // SAFETY: raw_name was allocated by this allocator and is freed once.
-        check_status(api, unsafe {
-            (api.table().AllocatorFree)(allocator, raw_name.cast())
-        })?;
+        status_call!(api, AllocatorFree(allocator, raw_name.cast()))?;
 
         let mut type_info = ptr::null_mut();
         // SAFETY: session is live and type_info is writable output storage.
-        let status = unsafe {
-            match kind {
-                IoKind::Input => {
-                    (api.table().SessionGetInputTypeInfo)(session, index, &mut type_info)
+        let status =
+            unsafe {
+                match kind {
+                    IoKind::Input => {
+                        api_function!(api, SessionGetInputTypeInfo)(session, index, &mut type_info)
+                    }
+                    IoKind::Output => {
+                        api_function!(api, SessionGetOutputTypeInfo)(session, index, &mut type_info)
+                    }
+                    IoKind::Initializer => api_function!(
+                        api,
+                        SessionGetOverridableInitializerTypeInfo
+                    )(session, index, &mut type_info),
                 }
-                IoKind::Output => {
-                    (api.table().SessionGetOutputTypeInfo)(session, index, &mut type_info)
-                }
-                IoKind::Initializer => (api.table().SessionGetOverridableInitializerTypeInfo)(
-                    session,
-                    index,
-                    &mut type_info,
-                ),
-            }
-        };
+            };
         check_status(api, status)?;
         let type_info = require_non_null(type_info, "model value type info")?;
         let _type_guard = TypeInfoGuard { api, type_info };
@@ -1906,9 +1886,7 @@ pub(super) fn read_value_type(
 ) -> Result<ValueTypeInfo> {
     let mut value_type = sys::ONNXType::ONNX_TYPE_UNKNOWN;
     // SAFETY: type_info is live and value_type is writable.
-    check_status(api, unsafe {
-        (api.table().GetOnnxTypeFromTypeInfo)(type_info, &mut value_type)
-    })?;
+    status_call!(api, GetOnnxTypeFromTypeInfo(type_info, &mut value_type))?;
     match value_type {
         sys::ONNXType::ONNX_TYPE_TENSOR => {
             read_tensor_type(api, type_info).map(ValueTypeInfo::Tensor)
@@ -1917,15 +1895,14 @@ pub(super) fn read_value_type(
             let mut sequence_info = ptr::null();
             // SAFETY: type_info is a live sequence description and owns the
             // borrowed sequence-info view.
-            check_status(api, unsafe {
-                (api.table().CastTypeInfoToSequenceTypeInfo)(type_info, &mut sequence_info)
-            })?;
+            status_call!(
+                api,
+                CastTypeInfoToSequenceTypeInfo(type_info, &mut sequence_info)
+            )?;
             let sequence_info = require_const_non_null(sequence_info, "sequence type info")?;
             let mut element = ptr::null_mut();
             // SAFETY: sequence_info is live and element is writable output.
-            check_status(api, unsafe {
-                (api.table().GetSequenceElementType)(sequence_info, &mut element)
-            })?;
+            status_call!(api, GetSequenceElementType(sequence_info, &mut element))?;
             let element = require_non_null(element, "sequence element type info")?;
             let _guard = TypeInfoGuard {
                 api,
@@ -1937,20 +1914,14 @@ pub(super) fn read_value_type(
             let mut map_info = ptr::null();
             // SAFETY: type_info is a live map description and owns the borrowed
             // map-info view.
-            check_status(api, unsafe {
-                (api.table().CastTypeInfoToMapTypeInfo)(type_info, &mut map_info)
-            })?;
+            status_call!(api, CastTypeInfoToMapTypeInfo(type_info, &mut map_info))?;
             let map_info = require_const_non_null(map_info, "map type info")?;
             let mut key = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
             // SAFETY: map_info is live and key is writable.
-            check_status(api, unsafe {
-                (api.table().GetMapKeyType)(map_info, &mut key)
-            })?;
+            status_call!(api, GetMapKeyType(map_info, &mut key))?;
             let mut value = ptr::null_mut();
             // SAFETY: map_info is live and value is writable output.
-            check_status(api, unsafe {
-                (api.table().GetMapValueType)(map_info, &mut value)
-            })?;
+            status_call!(api, GetMapValueType(map_info, &mut value))?;
             let value = require_non_null(value, "map value type info")?;
             let _guard = TypeInfoGuard {
                 api,
@@ -1965,15 +1936,17 @@ pub(super) fn read_value_type(
             let mut optional_info = ptr::null();
             // SAFETY: type_info is a live optional description and owns the
             // borrowed optional-info view.
-            check_status(api, unsafe {
-                (api.table().CastTypeInfoToOptionalTypeInfo)(type_info, &mut optional_info)
-            })?;
+            status_call!(
+                api,
+                CastTypeInfoToOptionalTypeInfo(type_info, &mut optional_info)
+            )?;
             let optional_info = require_const_non_null(optional_info, "optional type info")?;
             let mut contained = ptr::null_mut();
             // SAFETY: optional_info is live and contained is writable output.
-            check_status(api, unsafe {
-                (api.table().GetOptionalContainedTypeInfo)(optional_info, &mut contained)
-            })?;
+            status_call!(
+                api,
+                GetOptionalContainedTypeInfo(optional_info, &mut contained)
+            )?;
             let contained = require_non_null(contained, "optional contained type info")?;
             let _guard = TypeInfoGuard {
                 api,
@@ -1995,31 +1968,27 @@ pub(super) fn read_tensor_type(
 ) -> Result<TensorTypeInfo> {
     let mut tensor_info = ptr::null();
     // SAFETY: type_info is a tensor type and owns the returned borrowed view.
-    check_status(api, unsafe {
-        (api.table().CastTypeInfoToTensorInfo)(type_info, &mut tensor_info)
-    })?;
+    status_call!(api, CastTypeInfoToTensorInfo(type_info, &mut tensor_info))?;
     let tensor_info = require_const_non_null(tensor_info, "tensor type info")?;
     let mut element_type = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
     // SAFETY: tensor_info remains live with its owning type_info.
-    check_status(api, unsafe {
-        (api.table().GetTensorElementType)(tensor_info, &mut element_type)
-    })?;
+    status_call!(api, GetTensorElementType(tensor_info, &mut element_type))?;
     let mut rank = 0;
     // SAFETY: tensor_info is live and rank is writable.
-    check_status(api, unsafe {
-        (api.table().GetDimensionsCount)(tensor_info, &mut rank)
-    })?;
+    status_call!(api, GetDimensionsCount(tensor_info, &mut rank))?;
     let mut dimensions = vec![0_i64; rank];
     // SAFETY: dimensions contains rank writable entries.
-    check_status(api, unsafe {
-        (api.table().GetDimensions)(tensor_info, dimensions.as_mut_ptr(), rank)
-    })?;
+    status_call!(
+        api,
+        GetDimensions(tensor_info, dimensions.as_mut_ptr(), rank)
+    )?;
     let mut symbols = vec![ptr::null(); rank];
     // SAFETY: symbols contains rank writable entries and borrowed strings
     // remain valid while type_info is live.
-    check_status(api, unsafe {
-        (api.table().GetSymbolicDimensions)(tensor_info, symbols.as_mut_ptr(), rank)
-    })?;
+    status_call!(
+        api,
+        GetSymbolicDimensions(tensor_info, symbols.as_mut_ptr(), rank)
+    )?;
     let dimensions = dimensions
         .into_iter()
         .zip(symbols)

@@ -25,6 +25,18 @@ use snafu::Snafu;
 mod bindings;
 pub use bindings::*;
 
+// Stable ONNX element-type discriminants introduced after the vendored API 21
+// header. They remain plain wrapper constants so generated bindings stay an
+// unmodified representation of that header.
+pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1: ONNXTensorElementDataType =
+    ONNXTensorElementDataType(23);
+pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2: ONNXTensorElementDataType =
+    ONNXTensorElementDataType(24);
+pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2: ONNXTensorElementDataType =
+    ONNXTensorElementDataType(25);
+pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0: ONNXTensorElementDataType =
+    ONNXTensorElementDataType(26);
+
 /// Errors produced while loading the ONNX Runtime C API.
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -73,6 +85,13 @@ pub enum Error {
         api_version: u32,
         /// Runtime version string.
         runtime_version: String,
+    },
+
+    /// A negotiated API table unexpectedly omitted a function entry.
+    #[snafu(display("ONNX Runtime API table is missing `{name}`"))]
+    MissingApiFunction {
+        /// C API function field name.
+        name: &'static str,
     },
 }
 
@@ -192,6 +211,11 @@ impl Api {
         // SAFETY: the configured runtime and its immutable API table outlive self.
         unsafe { self.inner.api.as_ref() }
     }
+
+    /// Resolves a nullable C API table field after version negotiation.
+    pub fn function<T: Copy>(&self, function: Option<T>, name: &'static str) -> Result<T, Error> {
+        function.ok_or(Error::MissingApiFunction { name })
+    }
 }
 
 fn negotiate(base: *const OrtApiBase, origin: &str) -> Result<(NonNull<OrtApi>, String), Error> {
@@ -200,8 +224,11 @@ fn negotiate(base: *const OrtApiBase, origin: &str) -> Result<(NonNull<OrtApi>, 
     })?;
     // SAFETY: base is non-null and points to the immutable process-global table.
     let base_ref = unsafe { base.as_ref() };
+    let get_version_string = base_ref.GetVersionString.ok_or(Error::MissingApiFunction {
+        name: "GetVersionString",
+    })?;
     // SAFETY: this returns a static NUL-terminated string owned by the runtime.
-    let version_ptr = unsafe { (base_ref.GetVersionString)() };
+    let version_ptr = unsafe { get_version_string() };
     let version = if version_ptr.is_null() {
         "unknown".to_owned()
     } else {
@@ -210,8 +237,11 @@ fn negotiate(base: *const OrtApiBase, origin: &str) -> Result<(NonNull<OrtApi>, 
             .to_string_lossy()
             .into_owned()
     };
+    let get_api = base_ref
+        .GetApi
+        .ok_or(Error::MissingApiFunction { name: "GetApi" })?;
     // SAFETY: requesting the compile-time API version is the prescribed ABI handshake.
-    let api = unsafe { (base_ref.GetApi)(ORT_API_VERSION) };
+    let api = unsafe { get_api(ORT_API_VERSION) };
     let api = NonNull::new(api.cast_mut()).ok_or_else(|| Error::UnsupportedApi {
         api_version: ORT_API_VERSION,
         runtime_version: version.clone(),

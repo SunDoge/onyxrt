@@ -10,8 +10,9 @@ use snafu::Snafu;
 
 use crate::{
     ffi::{
-        self, AllocatedBufferGuard, AvailableProvidersGuard, check_status, cstring,
+        self, AllocatedBufferGuard, AvailableProvidersGuard, api_function, check_status, cstring,
         default_allocator, discard_provider_array, require_const_non_null, require_non_null,
+        status_call,
     },
     provider::{CpuExecutionProvider, ExecutionMode, GraphOptimizationLevel, LogLevel},
     session::SessionBuilder,
@@ -129,10 +130,10 @@ impl From<sys::ONNXTensorElementDataType> for ElementType {
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ => Self::Float8E5M2Fnuz,
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4 => Self::Uint4,
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4 => Self::Int4,
-            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1 => Self::Float4E2M1,
-            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2 => Self::Uint2,
-            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 => Self::Int2,
-            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0 => Self::Float8E8M0,
+            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1 => Self::Float4E2M1,
+            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2 => Self::Uint2,
+            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 => Self::Int2,
+            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0 => Self::Float8E8M0,
             _ => Self::Undefined,
         }
     }
@@ -239,9 +240,7 @@ impl ModelMetadata {
         let api = &self.environment.inner.api;
         let mut version = 0;
         // SAFETY: metadata is live and version is writable output storage.
-        check_status(api, unsafe {
-            (api.table().ModelMetadataGetVersion)(self.as_ptr(), &mut version)
-        })?;
+        status_call!(api, ModelMetadataGetVersion(self.as_ptr(), &mut version))?;
         Ok(version)
     }
 
@@ -252,14 +251,15 @@ impl ModelMetadata {
         let allocator = default_allocator(api)?;
         let mut value = ptr::null_mut();
         // SAFETY: metadata, allocator, and key are live; value is writable.
-        check_status(api, unsafe {
-            (api.table().ModelMetadataLookupCustomMetadataMap)(
+        status_call!(
+            api,
+            ModelMetadataLookupCustomMetadataMap(
                 self.as_ptr(),
                 allocator,
                 key.as_ptr(),
                 &mut value,
             )
-        })?;
+        )?;
         if value.is_null() {
             return Ok(None);
         }
@@ -283,21 +283,28 @@ impl ModelMetadata {
         // SAFETY: metadata and allocator are live; value is writable output.
         let status = unsafe {
             match kind {
-                MetadataStringKind::Producer => {
-                    (api.table().ModelMetadataGetProducerName)(self.as_ptr(), allocator, &mut value)
-                }
-                MetadataStringKind::GraphName => {
-                    (api.table().ModelMetadataGetGraphName)(self.as_ptr(), allocator, &mut value)
-                }
+                MetadataStringKind::Producer => api_function!(api, ModelMetadataGetProducerName)(
+                    self.as_ptr(),
+                    allocator,
+                    &mut value,
+                ),
+                MetadataStringKind::GraphName => api_function!(api, ModelMetadataGetGraphName)(
+                    self.as_ptr(),
+                    allocator,
+                    &mut value,
+                ),
                 MetadataStringKind::Domain => {
-                    (api.table().ModelMetadataGetDomain)(self.as_ptr(), allocator, &mut value)
+                    api_function!(api, ModelMetadataGetDomain)(self.as_ptr(), allocator, &mut value)
                 }
-                MetadataStringKind::Description => {
-                    (api.table().ModelMetadataGetDescription)(self.as_ptr(), allocator, &mut value)
-                }
-                MetadataStringKind::GraphDescription => (api
-                    .table()
-                    .ModelMetadataGetGraphDescription)(
+                MetadataStringKind::Description => api_function!(api, ModelMetadataGetDescription)(
+                    self.as_ptr(),
+                    allocator,
+                    &mut value,
+                ),
+                MetadataStringKind::GraphDescription => api_function!(
+                    api,
+                    ModelMetadataGetGraphDescription
+                )(
                     self.as_ptr(), allocator, &mut value
                 ),
             }
@@ -326,7 +333,7 @@ impl Drop for ModelMetadata {
     fn drop(&mut self) {
         // SAFETY: this object uniquely owns the native metadata handle.
         unsafe {
-            (self.environment.inner.api.table().ReleaseModelMetadata)(
+            api_function!(self.environment.inner.api, ReleaseModelMetadata)(
                 self.metadata as *mut sys::OrtModelMetadata,
             )
         };
@@ -403,11 +410,15 @@ unsafe impl Sync for EnvironmentInner {}
 impl Drop for EnvironmentInner {
     fn drop(&mut self) {
         // SAFETY: env was created by this exact API table and is released once.
-        unsafe { (self.api.table().ReleaseEnv)(self.env as *mut sys::OrtEnv) };
+        unsafe { api_function!(self.api, ReleaseEnv)(self.env as *mut sys::OrtEnv) };
     }
 }
 
 impl Environment {
+    pub(super) fn same_runtime(left: &Self, right: &Self) -> bool {
+        Arc::ptr_eq(&left.inner, &right.inner)
+    }
+
     /// Starts configuring an environment.
     pub fn builder() -> EnvironmentBuilder {
         EnvironmentBuilder::default()
@@ -433,9 +444,7 @@ impl Environment {
         let mut count = 0_i32;
         // SAFETY: both outputs point to writable storage. On success, ownership
         // of the returned array is transferred to AvailableProvidersGuard.
-        check_status(api, unsafe {
-            (api.table().GetAvailableProviders)(&mut providers, &mut count)
-        })?;
+        status_call!(api, GetAvailableProviders(&mut providers, &mut count))?;
         if count < 0 {
             if !providers.is_null() {
                 // SAFETY: the pointer came from GetAvailableProviders and must
@@ -540,7 +549,7 @@ impl EnvironmentBuilder {
         let mut env = ptr::null_mut();
         // SAFETY: arguments are valid and output points to writable storage.
         let status =
-            unsafe { (api.table().CreateEnv)(self.severity.into(), name.as_ptr(), &mut env) };
+            unsafe { api_function!(api, CreateEnv)(self.severity.into(), name.as_ptr(), &mut env) };
         check_status(&api, status)?;
         let env = require_non_null(env, "environment")?;
         Ok(Environment {

@@ -10,6 +10,7 @@ use onyxrt::{
         CpuExecutionProvider, CudaExecutionProvider, DnnlExecutionProvider, LogLevel,
         TensorRtExecutionProvider,
     },
+    raw::{Input as RawInput, MemoryInfo, Output as RawOutput, Value as RawValue},
     value::{
         Input, InputValue, IoBindingDeviceOutput, IoBindingInput, IoBindingOutput, MapInput,
         OutputBuffer, SequenceInput, StringInput, Value, ValueInput,
@@ -111,6 +112,31 @@ fn cpu_dlpack_identity_round_trip() {
         .cpu_provider(CpuExecutionProvider::new().with_arena(false))
         .build_from_bytes(IDENTITY_MODEL)
         .unwrap();
+
+    let memory_info = MemoryInfo::cpu(environment.clone()).unwrap();
+    let mut raw_data = [1.5_f32, -2.0, 7.25];
+    let raw_value =
+        RawValue::tensor(environment.clone(), &memory_info, &mut raw_data, [3]).unwrap();
+    let raw_inputs = [RawInput::new("x", &raw_value).unwrap()];
+    let mut raw_outputs = session.run_raw(&raw_inputs, &["y"]).unwrap();
+    assert_eq!(
+        raw_outputs[0].as_slice::<f32>().unwrap(),
+        &[1.5, -2.0, 7.25]
+    );
+    raw_outputs[0].as_slice_mut::<f32>().unwrap()[0] = 9.0;
+    assert_eq!(raw_outputs[0].as_slice::<f32>().unwrap()[0], 9.0);
+
+    let mut raw_output_data = [0.0_f32; 3];
+    let mut raw_output_value =
+        RawValue::tensor(environment.clone(), &memory_info, &mut raw_output_data, [3]).unwrap();
+    {
+        let mut outputs = [RawOutput::new("y", &mut raw_output_value).unwrap()];
+        session.run_raw_into(&raw_inputs, &mut outputs).unwrap();
+    }
+    assert_eq!(
+        raw_output_value.as_slice::<f32>().unwrap(),
+        &[1.5, -2.0, 7.25]
+    );
 
     let mut string_model = IDENTITY_MODEL.to_vec();
     let element_type_offsets = string_model

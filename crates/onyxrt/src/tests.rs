@@ -213,22 +213,22 @@ fn round_trips_all_supported_dlpack_types() {
         (
             DLDataTypeCode::FLOAT4_E2M1FN,
             4,
-            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
+            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
         ),
         (
             DLDataTypeCode::UINT,
             2,
-            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
+            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
         ),
         (
             DLDataTypeCode::INT,
             2,
-            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
+            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
         ),
         (
             DLDataTypeCode::FLOAT8_E8M0FNU,
             8,
-            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
+            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
         ),
     ];
 

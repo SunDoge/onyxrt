@@ -3,6 +3,7 @@
 pub mod io_binding;
 pub mod model;
 pub mod provider;
+pub mod raw;
 pub mod session;
 pub mod value;
 

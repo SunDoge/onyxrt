@@ -84,6 +84,37 @@ receives them as `Cuda` device allocations and synchronizes bound inputs and
 outputs around the run. `Session::run_all` and `Session::run_into` remain the
 simpler CPU-only paths.
 
+## Low-level values
+
+`onyxrt::raw` exposes RAII wrappers around `OrtMemoryInfo` and `OrtValue` for
+framework integrations that do not use DLPack. Typed CPU slices are checked
+against their shape and element type, while `Value::from_raw_parts` is the
+unsafe escape hatch for device memory or custom allocators:
+
+```rust,ignore
+use onyxrt::{
+    model::Environment,
+    raw::{Input, MemoryInfo, Value},
+};
+
+let environment = Environment::builder().build()?;
+let session = environment
+    .session_builder()
+    .build_from_file("model.onnx")?;
+let memory = MemoryInfo::cpu(environment.clone())?;
+let mut data = [1.0_f32, 2.0, 3.0];
+let value = Value::tensor(environment.clone(), &memory, &mut data, [3])?;
+let inputs = [Input::new("input", &value)?];
+let outputs = session.run_raw(&inputs, &["output"])?;
+let output: &[f32] = outputs[0].as_slice()?;
+# let _ = output;
+```
+
+For direct extensions, `Environment::raw_api`, `Session::as_ptr`,
+`RunOptions::as_ptr`, `MemoryInfo::as_ptr`, and `Value::{as_ptr, as_mut_ptr,
+into_raw}` expose the underlying handles without transferring ownership unless
+explicitly documented.
+
 For dynamic output shapes, use `IoBindingDeviceOutput::cpu` or
 `IoBindingDeviceOutput::cuda` with `Session::run_with_iobinding_outputs`.
 ONNX Runtime allocates each output on the requested device and onyxrt returns

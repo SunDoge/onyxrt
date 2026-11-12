@@ -15,8 +15,8 @@ use snafu::{Snafu, ensure};
 
 use crate::{
     ffi::{
-        self, OutputOwner, ShapeInfoGuard, TypeInfoGuard, ValueGuard, check_status, cstring,
-        default_allocator, require_const_non_null, require_non_null,
+        self, OutputOwner, ShapeInfoGuard, TypeInfoGuard, ValueGuard, cstring, default_allocator,
+        require_const_non_null, require_non_null, status_call,
     },
     model::Environment,
 };
@@ -638,25 +638,27 @@ pub(super) fn create_dlpack_memory_info(
     let mut memory_info = ptr::null_mut();
     if device.device_type == DLDeviceType::CPU && device.device_id == 0 {
         // SAFETY: output points to writable storage and enum values are valid.
-        check_status(api, unsafe {
-            (api.table().CreateCpuMemoryInfo)(
+        status_call!(
+            api,
+            CreateCpuMemoryInfo(
                 sys::OrtAllocatorType::OrtArenaAllocator,
                 sys::OrtMemType::OrtMemTypeDefault,
                 &mut memory_info,
             )
-        })?;
+        )?;
     } else if device.device_type == DLDeviceType::CUDA && device.device_id >= 0 {
         // SAFETY: `Cuda` is the allocator name required by ONNX Runtime for
         // CUDA device allocations; output points to writable storage.
-        check_status(api, unsafe {
-            (api.table().CreateMemoryInfo)(
+        status_call!(
+            api,
+            CreateMemoryInfo(
                 c"Cuda".as_ptr(),
                 sys::OrtAllocatorType::OrtDeviceAllocator,
                 device.device_id,
                 sys::OrtMemType::OrtMemTypeDefault,
                 &mut memory_info,
             )
-        })?;
+        )?;
     } else {
         return Err(Error::UnsupportedIoBindingDevice {
             device_type: device.device_type,
@@ -681,8 +683,9 @@ pub(super) fn create_external_tensor(
     let shape = tensor.shape();
     // SAFETY: memory_info and shape are live, data describes tensor.num_bytes()
     // external bytes, and ORT does not take ownership of the allocation.
-    check_status(api, unsafe {
-        (api.table().CreateTensorWithDataAsOrtValue)(
+    status_call!(
+        api,
+        CreateTensorWithDataAsOrtValue(
             memory_info,
             data.cast_mut().cast(),
             tensor.num_bytes(),
@@ -691,7 +694,7 @@ pub(super) fn create_external_tensor(
             dlpack_to_onnx(tensor.dtype())?,
             &mut value,
         )
-    })?;
+    )?;
     Ok(require_non_null(value, "I/O Binding tensor value")?)
 }
 
@@ -766,10 +769,10 @@ pub(super) fn dlpack_to_onnx(dtype: DLDataType) -> Result<sys::ONNXTensorElement
         (DLDataTypeCode::FLOAT8_E5M2FNUZ, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ,
         (DLDataTypeCode::UINT, 4) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4,
         (DLDataTypeCode::INT, 4) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
-        (DLDataTypeCode::FLOAT4_E2M1FN, 4) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
-        (DLDataTypeCode::UINT, 2) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
-        (DLDataTypeCode::INT, 2) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
-        (DLDataTypeCode::FLOAT8_E8M0FNU, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
+        (DLDataTypeCode::FLOAT4_E2M1FN, 4) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
+        (DLDataTypeCode::UINT, 2) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
+        (DLDataTypeCode::INT, 2) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
+        (DLDataTypeCode::FLOAT8_E8M0FNU, 8) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
         _ => return Err(Error::UnsupportedDlpackType { dtype }),
     };
     Ok(value)
@@ -799,10 +802,10 @@ pub(super) fn onnx_to_dlpack(element_type: sys::ONNXTensorElementDataType) -> Re
         O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ => (DLDataTypeCode::FLOAT8_E5M2FNUZ, 8),
         O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4 => (DLDataTypeCode::UINT, 4),
         O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4 => (DLDataTypeCode::INT, 4),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1 => (DLDataTypeCode::FLOAT4_E2M1FN, 4),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2 => (DLDataTypeCode::UINT, 2),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 => (DLDataTypeCode::INT, 2),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0 => (DLDataTypeCode::FLOAT8_E8M0FNU, 8),
+        sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1 => (DLDataTypeCode::FLOAT4_E2M1FN, 4),
+        sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2 => (DLDataTypeCode::UINT, 2),
+        sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 => (DLDataTypeCode::INT, 2),
+        sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0 => (DLDataTypeCode::FLOAT8_E8M0FNU, 8),
         _ => return Err(Error::UnsupportedOnnxType { element_type }),
     };
     Ok(DLDataType {
@@ -828,15 +831,16 @@ pub(super) fn create_string_tensor_parts(
 ) -> Result<*mut sys::OrtValue> {
     let mut value = ptr::null_mut();
     // SAFETY: allocator and shape are live; value is writable output storage.
-    check_status(api, unsafe {
-        (api.table().CreateTensorAsOrtValue)(
+    status_call!(
+        api,
+        CreateTensorAsOrtValue(
             allocator,
             shape.as_ptr(),
             shape.len(),
             sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING,
             &mut value,
         )
-    })?;
+    )?;
     let value = require_non_null(value, "string input value")?;
     let mut guard = ValueGuard::new(api, value);
     let pointers = strings
@@ -850,9 +854,7 @@ pub(super) fn create_string_tensor_parts(
     };
     // SAFETY: every pointer is NUL-terminated and remains live for the call;
     // a zero-length tensor uses a null array pointer.
-    check_status(api, unsafe {
-        (api.table().FillStringTensor)(value, pointers_ptr, pointers.len())
-    })?;
+    status_call!(api, FillStringTensor(value, pointers_ptr, pointers.len()))?;
     guard.disarm();
     Ok(value)
 }
@@ -934,9 +936,10 @@ pub(super) fn create_container_input(
     let mut value = ptr::null_mut();
     // SAFETY: child pointers are live for the call. CreateValue retains the
     // supplied values, so the temporary child guards may be dropped afterward.
-    check_status(api, unsafe {
-        (api.table().CreateValue)(pointers, children.len(), value_type, &mut value)
-    })?;
+    status_call!(
+        api,
+        CreateValue(pointers, children.len(), value_type, &mut value)
+    )?;
     Ok(require_non_null(value, description)?)
 }
 
@@ -948,15 +951,11 @@ pub(super) fn output_to_value(
     let mut value_guard = ValueGuard::new(api, value);
     let mut is_tensor = 0;
     // SAFETY: value is a live ORT output and is_tensor is writable.
-    check_status(api, unsafe {
-        (api.table().IsTensor)(value.cast_const(), &mut is_tensor)
-    })?;
+    status_call!(api, IsTensor(value.cast_const(), &mut is_tensor))?;
     if is_tensor == 0 {
         let mut info = ptr::null_mut();
         // SAFETY: value is live and info is writable output storage.
-        check_status(api, unsafe {
-            (api.table().GetTypeInfo)(value.cast_const(), &mut info)
-        })?;
+        status_call!(api, GetTypeInfo(value.cast_const(), &mut info))?;
         let info = require_non_null(info, "output type info")?;
         let _guard = TypeInfoGuard {
             api,
@@ -964,9 +963,7 @@ pub(super) fn output_to_value(
         };
         let mut value_type = sys::ONNXType::ONNX_TYPE_UNKNOWN;
         // SAFETY: info is live and value_type is writable.
-        check_status(api, unsafe {
-            (api.table().GetOnnxTypeFromTypeInfo)(info, &mut value_type)
-        })?;
+        status_call!(api, GetOnnxTypeFromTypeInfo(info, &mut value_type))?;
         return match value_type {
             sys::ONNXType::ONNX_TYPE_SEQUENCE
             | sys::ONNXType::ONNX_TYPE_MAP
@@ -979,16 +976,12 @@ pub(super) fn output_to_value(
 
     let mut info = ptr::null_mut();
     // SAFETY: value is a live tensor and info is writable output storage.
-    check_status(api, unsafe {
-        (api.table().GetTensorTypeAndShape)(value, &mut info)
-    })?;
+    status_call!(api, GetTensorTypeAndShape(value, &mut info))?;
     let info = require_non_null(info, "output tensor shape info")?;
     let info_guard = ShapeInfoGuard { api, info };
     let mut element_type = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
     // SAFETY: info is live and element_type is writable.
-    check_status(api, unsafe {
-        (api.table().GetTensorElementType)(info, &mut element_type)
-    })?;
+    status_call!(api, GetTensorElementType(info, &mut element_type))?;
     drop(info_guard);
 
     if element_type == sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING {
@@ -1009,16 +1002,15 @@ pub(super) fn container_output(
     let allocator = default_allocator(api)?;
     let mut count = 0;
     // SAFETY: value is a live container and count is writable output storage.
-    check_status(api, unsafe {
-        (api.table().GetValueCount)(value.cast_const(), &mut count)
-    })?;
+    status_call!(api, GetValueCount(value.cast_const(), &mut count))?;
     let mut children = Vec::with_capacity(count);
     for index in 0..count {
         let mut child = ptr::null_mut();
         // SAFETY: index is within the queried child count and child is writable.
-        check_status(api, unsafe {
-            (api.table().GetValue)(value.cast_const(), index as i32, allocator, &mut child)
-        })?;
+        status_call!(
+            api,
+            GetValue(value.cast_const(), index as i32, allocator, &mut child)
+        )?;
         let child = require_non_null(child, "container child value")?;
         children.push(output_to_value(environment.clone(), child)?);
     }
@@ -1057,33 +1049,26 @@ pub(super) fn string_output(api: &sys::Api, value: *mut sys::OrtValue) -> Result
     let value_guard = ValueGuard::new(api, value);
     let mut info = ptr::null_mut();
     // SAFETY: value is live and info is writable output storage.
-    check_status(api, unsafe {
-        (api.table().GetTensorTypeAndShape)(value, &mut info)
-    })?;
+    status_call!(api, GetTensorTypeAndShape(value, &mut info))?;
     let info = require_non_null(info, "string tensor shape info")?;
     let info_guard = ShapeInfoGuard { api, info };
     let mut rank = 0;
     // SAFETY: info is live and rank is writable.
-    check_status(api, unsafe {
-        (api.table().GetDimensionsCount)(info, &mut rank)
-    })?;
+    status_call!(api, GetDimensionsCount(info, &mut rank))?;
     let mut shape = vec![0_i64; rank];
     // SAFETY: shape contains rank writable entries.
-    check_status(api, unsafe {
-        (api.table().GetDimensions)(info, shape.as_mut_ptr(), rank)
-    })?;
+    status_call!(api, GetDimensions(info, shape.as_mut_ptr(), rank))?;
     let mut element_count = 0;
     // SAFETY: info is live and element_count is writable.
-    check_status(api, unsafe {
-        (api.table().GetTensorShapeElementCount)(info, &mut element_count)
-    })?;
+    status_call!(api, GetTensorShapeElementCount(info, &mut element_count))?;
     drop(info_guard);
 
     let mut data_len = 0;
     // SAFETY: value is a live string tensor and data_len is writable.
-    check_status(api, unsafe {
-        (api.table().GetStringTensorDataLength)(value.cast_const(), &mut data_len)
-    })?;
+    status_call!(
+        api,
+        GetStringTensorDataLength(value.cast_const(), &mut data_len)
+    )?;
     let mut data = vec![0_u8; data_len];
     let mut offsets = vec![0_usize; element_count];
     let data_ptr = if data.is_empty() {
@@ -1097,15 +1082,16 @@ pub(super) fn string_output(api: &sys::Api, value: *mut sys::OrtValue) -> Result
         offsets.as_mut_ptr()
     };
     // SAFETY: buffers match the exact sizes queried from the tensor.
-    check_status(api, unsafe {
-        (api.table().GetStringTensorContent)(
+    status_call!(
+        api,
+        GetStringTensorContent(
             value.cast_const(),
             data_ptr,
             data.len(),
             offsets_ptr,
             offsets.len(),
         )
-    })?;
+    )?;
     let mut values = Vec::with_capacity(element_count);
     for (index, start) in offsets.iter().copied().enumerate() {
         let end = offsets.get(index + 1).copied().unwrap_or(data.len());
@@ -1135,34 +1121,24 @@ pub(super) fn output_to_dlpack(
     let mut value_guard = ValueGuard::new(&api, value);
     let mut info = ptr::null_mut();
     // SAFETY: value is a live ORT output and info is writable output storage.
-    check_status(&api, unsafe {
-        (api.table().GetTensorTypeAndShape)(value, &mut info)
-    })?;
+    status_call!(&api, GetTensorTypeAndShape(value, &mut info))?;
     let info = require_non_null(info, "tensor shape info")?;
     let info_guard = ShapeInfoGuard { api: &api, info };
 
     let mut element_type = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
     // SAFETY: info remains live until info_guard is dropped.
-    check_status(&api, unsafe {
-        (api.table().GetTensorElementType)(info, &mut element_type)
-    })?;
+    status_call!(&api, GetTensorElementType(info, &mut element_type))?;
     let dtype = onnx_to_dlpack(element_type)?;
     let mut memory_info = ptr::null();
     // SAFETY: value is live and memory_info is writable borrowed output storage.
-    check_status(&api, unsafe {
-        (api.table().GetTensorMemoryInfo)(value, &mut memory_info)
-    })?;
+    status_call!(&api, GetTensorMemoryInfo(value, &mut memory_info))?;
     let memory_info = require_const_non_null(memory_info, "tensor memory info")?;
     let mut memory_name = ptr::null();
     let mut device_id = 0;
     // SAFETY: memory_info is borrowed from the live tensor value.
-    check_status(&api, unsafe {
-        (api.table().MemoryInfoGetName)(memory_info, &mut memory_name)
-    })?;
+    status_call!(&api, MemoryInfoGetName(memory_info, &mut memory_name))?;
     // SAFETY: memory_info is live and device_id is writable.
-    check_status(&api, unsafe {
-        (api.table().MemoryInfoGetId)(memory_info, &mut device_id)
-    })?;
+    status_call!(&api, MemoryInfoGetId(memory_info, &mut device_id))?;
     let memory_name = require_const_non_null(memory_name, "tensor memory name")?;
     // SAFETY: ORT memory-info names are NUL-terminated for the value lifetime.
     let memory_name = unsafe { CStr::from_ptr(memory_name) }
@@ -1187,24 +1163,16 @@ pub(super) fn output_to_dlpack(
     };
     let mut rank = 0;
     // SAFETY: info is valid and rank is writable.
-    check_status(&api, unsafe {
-        (api.table().GetDimensionsCount)(info, &mut rank)
-    })?;
+    status_call!(&api, GetDimensionsCount(info, &mut rank))?;
     let mut shape = vec![0_i64; rank];
     // SAFETY: shape has exactly rank writable elements.
-    check_status(&api, unsafe {
-        (api.table().GetDimensions)(info, shape.as_mut_ptr(), rank)
-    })?;
+    status_call!(&api, GetDimensions(info, shape.as_mut_ptr(), rank))?;
     let mut data = ptr::null_mut();
     // SAFETY: value is a live tensor value and data is writable output storage.
-    check_status(&api, unsafe {
-        (api.table().GetTensorMutableData)(value, &mut data)
-    })?;
+    status_call!(&api, GetTensorMutableData(value, &mut data))?;
     let mut element_count = 0;
     // SAFETY: info remains live and element_count is writable.
-    check_status(&api, unsafe {
-        (api.table().GetTensorShapeElementCount)(info, &mut element_count)
-    })?;
+    status_call!(&api, GetTensorShapeElementCount(info, &mut element_count))?;
     if data.is_null() && element_count != 0 {
         return Err(Error::NullPointer {
             what: "tensor data",

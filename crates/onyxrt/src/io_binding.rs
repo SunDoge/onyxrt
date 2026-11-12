@@ -12,7 +12,9 @@ use onyxrt_sys as sys;
 use snafu::{Snafu, ensure};
 
 use crate::{
-    ffi::{self, IoBindingGuard, MemoryInfoGuard, ValueGuard, check_status},
+    ffi::{
+        self, IoBindingGuard, MemoryInfoGuard, ValueGuard, api_function, check_status, status_call,
+    },
     model::Environment,
     session::{RunOptions, Session},
     value::{
@@ -91,9 +93,10 @@ impl<'session> IoBinding<'session> {
                 let value_guard = ValueGuard::new(api, value);
                 // SAFETY: the scoped BoundIoBinding retains the value and its
                 // external DLPack allocation until the native binding clears it.
-                check_status(api, unsafe {
-                    (api.table().BindInput)(self.binding, input.name.as_ptr(), value.cast_const())
-                })?;
+                status_call!(
+                    api,
+                    BindInput(self.binding, input.name.as_ptr(), value.cast_const(),)
+                )?;
                 memory_infos.push(memory_guard);
                 values.push(value_guard);
             }
@@ -104,9 +107,10 @@ impl<'session> IoBinding<'session> {
                 let value_guard = ValueGuard::new(api, value);
                 // SAFETY: output storage is exclusively borrowed for the full
                 // BoundIoBinding lifetime.
-                check_status(api, unsafe {
-                    (api.table().BindOutput)(self.binding, output.name.as_ptr(), value.cast_const())
-                })?;
+                status_call!(
+                    api,
+                    BindOutput(self.binding, output.name.as_ptr(), value.cast_const(),)
+                )?;
                 memory_infos.push(memory_guard);
                 values.push(value_guard);
             }
@@ -131,8 +135,8 @@ impl<'session> IoBinding<'session> {
         let api = &self.session.environment.inner.api;
         // SAFETY: the binding is live and uniquely accessed through &mut self.
         unsafe {
-            (api.table().ClearBoundInputs)(self.binding);
-            (api.table().ClearBoundOutputs)(self.binding);
+            api_function!(api, ClearBoundInputs)(self.binding);
+            api_function!(api, ClearBoundOutputs)(self.binding);
         }
     }
 }
@@ -141,7 +145,9 @@ impl Drop for IoBinding<'_> {
     fn drop(&mut self) {
         self.clear();
         // SAFETY: this object uniquely owns the live native binding.
-        unsafe { (self.session.environment.inner.api.table().ReleaseIoBinding)(self.binding) };
+        unsafe {
+            api_function!(self.session.environment.inner.api, ReleaseIoBinding)(self.binding)
+        };
     }
 }
 
@@ -175,22 +181,19 @@ impl BoundIoBinding<'_, '_> {
         let session = self.binding.session;
         let api = &session.environment.inner.api;
         // SAFETY: all external values remain retained by self.
-        check_status(api, unsafe {
-            (api.table().SynchronizeBoundInputs)(self.binding.binding)
-        })?;
+        status_call!(api, SynchronizeBoundInputs(self.binding.binding))?;
         // SAFETY: the session, native binding, options, and external values live
         // through the synchronous call.
-        check_status(api, unsafe {
-            (api.table().RunWithBinding)(
+        status_call!(
+            api,
+            RunWithBinding(
                 session.session as *mut sys::OrtSession,
                 options.map_or(ptr::null(), RunOptions::as_ptr),
                 self.binding.binding,
             )
-        })?;
+        )?;
         // SAFETY: wait until all provider writes to external outputs complete.
-        check_status(api, unsafe {
-            (api.table().SynchronizeBoundOutputs)(self.binding.binding)
-        })?;
+        status_call!(api, SynchronizeBoundOutputs(self.binding.binding))?;
         Ok(())
     }
 }
@@ -240,9 +243,7 @@ impl PendingIoBindingRun<'_> {
             .binding;
         let api = &self.session.environment.inner.api;
         // SAFETY: the binding and all bound storage remain live in self.
-        check_status(api, unsafe {
-            (api.table().SynchronizeBoundOutputs)(binding)
-        })?;
+        status_call!(api, SynchronizeBoundOutputs(binding))?;
         self.synchronized = true;
         Ok(())
     }
@@ -260,12 +261,12 @@ impl Drop for PendingIoBindingRun<'_> {
             .binding;
         let api = &self.session.environment.inner.api;
         // SAFETY: all bound storage remains live until after this Drop body.
-        let status = unsafe { (api.table().SynchronizeBoundOutputs)(binding) };
-        if !status.0.is_null() {
+        let status = unsafe { api_function!(api, SynchronizeBoundOutputs)(binding) };
+        if !status.is_null() {
             // Drop cannot report synchronization errors, but must release the
             // owned status object.
             // SAFETY: a non-null status is owned by the caller.
-            unsafe { (api.table().ReleaseStatus)(status.0) };
+            unsafe { api_function!(api, ReleaseStatus)(status) };
         }
         self.synchronized = true;
     }
@@ -364,7 +365,7 @@ pub(super) fn async_callback_result(
     num_outputs: usize,
     status: sys::OrtStatusPtr,
 ) -> Result<Vec<usize>> {
-    if !status.0.is_null() {
+    if !status.is_null() {
         release_callback_outputs(&completion.api, outputs, num_outputs);
         check_status(&completion.api, status)?;
         return Ok(Vec::new());
@@ -419,7 +420,7 @@ pub(super) fn release_callback_outputs(
     let values = unsafe { std::slice::from_raw_parts(outputs, num_outputs) };
     for value in values.iter().copied().filter(|value| !value.is_null()) {
         // SAFETY: callback output ownership belongs to the caller.
-        unsafe { (api.table().ReleaseValue)(value) };
+        unsafe { api_function!(api, ReleaseValue)(value) };
     }
 }
 
@@ -506,7 +507,7 @@ impl Drop for RunFuture<'_> {
                 // SAFETY: the unconsumed successful callback transferred each
                 // output value to this future, which releases it exactly once.
                 unsafe {
-                    (self.session.environment.inner.api.table().ReleaseValue)(
+                    api_function!(self.session.environment.inner.api, ReleaseValue)(
                         value as *mut sys::OrtValue,
                     )
                 };
