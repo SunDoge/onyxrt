@@ -1,6 +1,6 @@
 [package]
 name = "onyxrt"
-description = "Safe ONNX Runtime bindings with SNAFU errors and DLPack interoperability"
+description = "Safe dynamically loaded ONNX Runtime bindings"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,9 +14,22 @@ categories = ["api-bindings", "science"]
 include = ["src/**", "tests/**", "CHANGELOG.md", "../../README.md", "LICENSE-MIT"]
 
 [dependencies]
-dlpark.workspace = true
+dlpark = { workspace = true, optional = true }
 snafu.workspace = true
 onyxrt-sys = { path = "../onyxrt-sys", version = "0.1.0" }
+
+[features]
+default = []
+# DLPack is deliberately opt-in. Integration-specific dlpark features are
+# forwarded individually; dlpark's `cpu-all` test bundle is not public API.
+dlpack = ["dep:dlpark"]
+dlpack-candle = ["dlpack", "dlpark/candle"]
+dlpack-cudarc = ["dlpack", "dlpark/cudarc"]
+dlpack-half = ["dlpack", "dlpark/half"]
+dlpack-image = ["dlpack", "dlpark/image"]
+dlpack-ndarray = ["dlpack", "dlpark/ndarray"]
+dlpack-pyo3 = ["dlpack", "dlpark/pyo3"]
+dlpack-safetensors = ["dlpack", "dlpark/safetensors"]
 
 [dev-dependencies]
 dlpark = { workspace = true, features = ["ndarray"] }

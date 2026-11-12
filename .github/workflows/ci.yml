@@ -30,6 +30,8 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
       - run: cargo test --workspace
+      - if: runner.os == 'Linux'
+        run: cargo check -p onyxrt --all-features --all-targets
 
   check-macos:
     if: github.event_name == 'workflow_dispatch'
@@ -82,4 +84,4 @@ jobs:
           PY
           )"
           echo "ONYXRT_TEST_DYLIB=$path" >> "$GITHUB_ENV"
-      - run: cargo test -p onyxrt --test cpu_identity cpu_dlpack_identity_round_trip -- --ignored
+      - run: cargo test -p onyxrt --features dlpack,dlpack-ndarray --test cpu_identity -- --ignored

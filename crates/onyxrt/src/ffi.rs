@@ -6,8 +6,6 @@ use std::{
 use onyxrt_sys as sys;
 use snafu::Snafu;
 
-use crate::model::Environment;
-
 pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -31,56 +29,6 @@ pub(super) enum Error {
     },
 }
 
-pub(super) struct OutputOwner {
-    pub(super) environment: Environment,
-    pub(super) value: usize,
-}
-
-impl Drop for OutputOwner {
-    fn drop(&mut self) {
-        // SAFETY: this owner received the unique live OrtValue and drops it once.
-        unsafe {
-            api_function!(self.environment.inner.api, ReleaseValue)(
-                self.value as *mut sys::OrtValue,
-            )
-        };
-    }
-}
-
-pub(super) struct ValueGuard<'a> {
-    pub(super) api: &'a sys::Api,
-    pub(super) ptr: *mut sys::OrtValue,
-}
-
-impl<'a> ValueGuard<'a> {
-    pub(super) fn new(api: &'a sys::Api, ptr: *mut sys::OrtValue) -> Self {
-        Self { api, ptr }
-    }
-
-    pub(super) fn disarm(&mut self) {
-        self.ptr = ptr::null_mut();
-    }
-}
-
-impl Drop for ValueGuard<'_> {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // SAFETY: a non-null guard pointer is uniquely owned and live.
-            unsafe { api_function!(self.api, ReleaseValue)(self.ptr) };
-        }
-    }
-}
-
-pub(super) struct MemoryInfoGuard<'a> {
-    pub(super) api: &'a sys::Api,
-    pub(super) memory_info: *mut sys::OrtMemoryInfo,
-}
-
-pub(super) struct IoBindingGuard<'a> {
-    pub(super) api: &'a sys::Api,
-    pub(super) binding: *mut sys::OrtIoBinding,
-}
-
 pub(super) struct AllocatedBufferGuard<'a> {
     pub(super) api: &'a sys::Api,
     pub(super) allocator: *mut sys::OrtAllocator,
@@ -99,20 +47,6 @@ impl Drop for AllocatedBufferGuard<'_> {
             // SAFETY: Drop cannot report the error, but owns the status.
             unsafe { api_function!(self.api, ReleaseStatus)(status) };
         }
-    }
-}
-
-impl Drop for IoBindingGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns the binding pointer.
-        unsafe { api_function!(self.api, ReleaseIoBinding)(self.binding) };
-    }
-}
-
-impl Drop for MemoryInfoGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns a live memory-info object.
-        unsafe { api_function!(self.api, ReleaseMemoryInfo)(self.memory_info) };
     }
 }
 

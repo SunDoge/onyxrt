@@ -1,28 +1,37 @@
+//! Low-level RAII wrappers for ONNX Runtime values and tensor memory.
+//!
+//! This module works directly with `OrtValue` and `OrtMemoryInfo`. It is the
+//! core value and inference API and the foundation on which tensor adapters
+//! can be built.
+
 use std::{
-    ffi::{CStr, CString, NulError},
-    ptr,
-    string::FromUtf8Error,
+    ffi::{CStr, CString, c_void},
+    future::Future,
+    marker::PhantomData,
+    mem::{align_of, size_of_val},
+    pin::Pin,
+    ptr::{self, NonNull},
+    slice,
+    sync::Arc,
+    task::{Context, Poll},
 };
 
-use dlpark::{
-    DlpackFlags, Managed, ManagedTensorBase, TensorMut, TensorRef, TensorView,
-    ffi::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType},
-    metadata::Dynamic,
-    versioned,
-};
 use onyxrt_sys as sys;
 use snafu::{Snafu, ensure};
 
 use crate::{
     ffi::{
-        self, OutputOwner, ShapeInfoGuard, TypeInfoGuard, ValueGuard, cstring, default_allocator,
-        require_const_non_null, require_non_null, status_call,
+        self, ShapeInfoGuard, api_function, check_status, cstring, require_non_null, status_call,
     },
-    model::Environment,
+    io_binding::{AsyncCompletion, async_run_callback},
+    model::{ElementType, Environment},
+    session::{RunOptions, Session},
 };
 
+/// Result type for value and inference operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Errors produced by ONNX Runtime value and inference operations.
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum Error {
@@ -31,96 +40,53 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("invalid DLPack tensor: {source}"))]
-    DlpackTensor { source: dlpark::tensor::Error },
+    #[snafu(transparent)]
+    Session { source: crate::session::Error },
 
-    #[snafu(display("could not create DLPack output metadata: {source}"))]
-    DlpackMetadata { source: dlpark::metadata::Error },
+    #[snafu(transparent)]
+    Async { source: crate::io_binding::Error },
 
-    #[snafu(display(
-        "DLPack device {:?}:{} is unsupported; expected CPU:0",
-        device_type,
-        device_id
-    ))]
-    UnsupportedDevice {
-        device_type: DLDeviceType,
-        device_id: i32,
+    #[snafu(display("object belongs to a different ONNX Runtime environment"))]
+    ForeignEnvironment,
+
+    #[snafu(display("tensor shape dimension {axis} is negative: {value}"))]
+    NegativeDimension { axis: usize, value: i64 },
+
+    #[snafu(display("tensor element count overflows usize"))]
+    ElementCountOverflow,
+
+    #[snafu(display("tensor shape requires {expected} elements, got {actual}"))]
+    ElementCount { expected: usize, actual: usize },
+
+    #[snafu(display("OrtValue is not a dense tensor"))]
+    NotTensor,
+
+    #[snafu(display("OrtValue is not a sparse tensor"))]
+    NotSparseTensor,
+
+    #[snafu(display("tensor has element type {actual:?}, expected {expected:?}"))]
+    ElementTypeMismatch {
+        expected: ElementType,
+        actual: ElementType,
     },
 
-    #[snafu(display(
-        "DLPack device {:?}:{} is unsupported for I/O Binding; expected CPU:0 or CUDA:<non-negative>",
-        device_type,
-        device_id
-    ))]
-    UnsupportedIoBindingDevice {
-        device_type: DLDeviceType,
-        device_id: i32,
-    },
+    #[snafu(display("tensor memory is not CPU-accessible"))]
+    NonCpuMemory,
 
-    #[snafu(display("ONNX Runtime tensor memory `{name}` on device {device_id} is unsupported"))]
-    UnsupportedOrtMemory { name: String, device_id: i32 },
+    #[snafu(display("tensor data pointer is not aligned for the requested Rust type"))]
+    MisalignedData,
 
-    #[snafu(display(
-        "unsupported DLPack dtype (code={}, bits={}, lanes={})",
-        dtype.code.0,
-        dtype.bits,
-        dtype.lanes
-    ))]
-    UnsupportedDlpackType { dtype: DLDataType },
+    #[snafu(display("ONNX Runtime returned unknown allocator type {value}"))]
+    UnknownAllocatorType { value: i32 },
 
-    #[snafu(display(
-        "unsupported DLPack flags {flags:?} for dtype (code={}, bits={}, lanes={})",
-        dtype.code.0,
-        dtype.bits,
-        dtype.lanes
-    ))]
-    UnsupportedDlpackFlags {
-        flags: DlpackFlags,
-        dtype: DLDataType,
-    },
+    #[snafu(display("ONNX Runtime returned unknown memory type {value}"))]
+    UnknownMemoryType { value: i32 },
 
-    #[snafu(display("unsupported ONNX tensor element type {element_type:?}"))]
-    UnsupportedOnnxType {
-        element_type: sys::ONNXTensorElementDataType,
-    },
+    #[snafu(display("container index {index} exceeds ONNX Runtime's i32 index range"))]
+    ContainerIndexOverflow { index: usize },
 
-    #[snafu(display("unsupported ONNX value type {value_type:?}; expected a tensor"))]
-    UnsupportedValueType { value_type: sys::ONNXType },
-
-    #[snafu(display("ONNX Runtime returned null for {what}"))]
-    NullPointer { what: &'static str },
-
-    #[snafu(display("string tensor shape dimension {axis} is negative: {value}"))]
-    InvalidStringDimension { axis: usize, value: i64 },
-
-    #[snafu(display("string tensor shape requires {expected} values, got {actual}"))]
-    StringElementCount { expected: usize, actual: usize },
-
-    #[snafu(display("string tensor element {index} contains an interior NUL byte"))]
-    InvalidStringElement { index: usize, source: NulError },
-
-    #[snafu(display("string tensor element count overflows usize"))]
-    StringElementCountOverflow,
-
-    #[snafu(display("string tensor element {index} is not valid UTF-8"))]
-    InvalidStringUtf8 { index: usize, source: FromUtf8Error },
-
-    #[snafu(display(
-        "string tensor element {index} has invalid byte range {start}..{end} for {data_len} bytes"
-    ))]
-    InvalidStringOffsets {
-        index: usize,
-        start: usize,
-        end: usize,
-        data_len: usize,
-    },
-
-    #[snafu(display("{kind} value contained {actual} children; expected {expected}"))]
-    ContainerValueCount {
-        kind: &'static str,
-        expected: usize,
-        actual: usize,
-    },
+    #[snafu(display("ONNX Runtime replaced preallocated output `{name}`"))]
+    ReplacedOutput { name: String },
 }
 
 impl From<ffi::Error> for Error {
@@ -131,513 +97,54 @@ impl From<ffi::Error> for Error {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum IoKind {
-    Input,
-    Output,
-    Initializer,
+/// ONNX Runtime memory placement information.
+pub struct MemoryInfo {
+    environment: Environment,
+    memory_info: NonNull<sys::OrtMemoryInfo>,
 }
 
-/// A named DLPack output returned by [`crate::session::Session::run_all`].
-pub struct Output {
-    pub(super) name: String,
-    pub(super) tensor: versioned::Dlpack,
-}
+// SAFETY: OrtMemoryInfo is immutable after construction and contains no Rust
+// references. Its environment retains the originating API table.
+unsafe impl Send for MemoryInfo {}
+// SAFETY: all exposed operations on memory info are read-only.
+unsafe impl Sync for MemoryInfo {}
 
-/// A string tensor owned by Rust.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StringTensor {
-    shape: Vec<i64>,
-    values: Vec<String>,
-}
-
-impl StringTensor {
-    /// Returns the tensor shape.
-    pub fn shape(&self) -> &[i64] {
-        &self.shape
-    }
-
-    /// Returns the flattened row-major string values.
-    pub fn values(&self) -> &[String] {
-        &self.values
-    }
-
-    /// Consumes the tensor and returns its flattened values.
-    pub fn into_values(self) -> Vec<String> {
-        self.values
-    }
-}
-
-/// A runtime output value supported by the high-level API.
-pub enum Value {
-    /// A numeric tensor exported through owning DLPack storage.
-    Tensor(versioned::Dlpack),
-    /// A string tensor copied into Rust-owned UTF-8 strings.
-    Strings(StringTensor),
-    /// A heterogeneous ONNX sequence.
-    Sequence(Vec<Value>),
-    /// An ONNX map represented by its key and value tensors.
-    Map {
-        /// The map key tensor.
-        keys: Box<Value>,
-        /// The map value tensor or sequence.
-        values: Box<Value>,
-    },
-    /// An ONNX optional value.
-    Optional(Option<Box<Value>>),
-}
-
-/// A named runtime value returned by [`crate::session::Session::run_values`].
-pub struct ValueOutput {
-    pub(super) name: String,
-    pub(super) value: Value,
-}
-
-impl ValueOutput {
-    /// Returns the model output name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Borrows the output value.
-    pub fn value(&self) -> &Value {
-        &self.value
-    }
-
-    /// Consumes the named output.
-    pub fn into_value(self) -> Value {
-        self.value
-    }
-}
-
-/// An owned string tensor input.
-pub struct StringInput {
-    name: CString,
-    shape: Vec<i64>,
-    values: Vec<CString>,
-}
-
-/// An unnamed runtime input used as a child of a sequence or map.
-pub enum InputValue<'a> {
-    /// A borrowed compact CPU DLPack tensor.
-    Tensor(TensorRef<'a>),
-    /// An owned string tensor.
-    Strings(StringValueInput),
-    /// A sequence of values with a common ONNX type.
-    Sequence(Vec<InputValue<'a>>),
-    /// A map represented by key and value tensors or containers.
-    Map {
-        /// Scalar-key tensor value.
-        keys: Box<InputValue<'a>>,
-        /// Map values.
-        values: Box<InputValue<'a>>,
-    },
-}
-
-/// An unnamed owned string tensor used inside a container input.
-pub struct StringValueInput {
-    shape: Vec<i64>,
-    values: Vec<CString>,
-}
-
-/// A named sequence input.
-pub struct SequenceInput<'a> {
-    name: CString,
-    pub(super) values: Vec<InputValue<'a>>,
-}
-
-/// A named map input.
-pub struct MapInput<'a> {
-    name: CString,
-    pub(super) keys: InputValue<'a>,
-    pub(super) values: InputValue<'a>,
-}
-
-impl StringInput {
-    /// Creates a compact string tensor input from flattened row-major values.
-    pub fn new<I, S>(name: &str, shape: impl Into<Vec<i64>>, values: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let shape = shape.into();
-        let values = string_input_values(&shape, values)?;
-        Ok(Self {
-            name: cstring(name, "input")?,
-            shape,
-            values,
-        })
-    }
-
-    /// Returns the input name.
-    pub fn name(&self) -> &CStr {
-        &self.name
-    }
-
-    /// Returns the tensor shape.
-    pub fn shape(&self) -> &[i64] {
-        &self.shape
-    }
-}
-
-impl<'a> InputValue<'a> {
-    /// Borrows a validated DLPack tensor as a container child.
-    pub fn from_dlpack<M>(tensor: &'a Managed<M>) -> Result<Self>
-    where
-        M: ManagedTensorBase,
-    {
-        let flags = tensor.flags();
-        let tensor = tensor
-            .validate()
-            .map_err(|source| Error::DlpackTensor { source })?;
-        validate_cpu_compact(&tensor)?;
-        validate_dlpack_flags(flags, tensor.dtype())?;
-        dlpack_to_onnx(tensor.dtype())?;
-        Ok(Self::Tensor(tensor))
-    }
-
-    /// Creates an owned string tensor container child.
-    pub fn strings<I, S>(shape: impl Into<Vec<i64>>, values: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        StringValueInput::new(shape, values).map(Self::Strings)
-    }
-
-    /// Creates a sequence container child.
-    pub fn sequence(values: impl IntoIterator<Item = InputValue<'a>>) -> Self {
-        Self::Sequence(values.into_iter().collect())
-    }
-
-    /// Creates a map container child.
-    pub fn map(keys: InputValue<'a>, values: InputValue<'a>) -> Self {
-        Self::Map {
-            keys: Box::new(keys),
-            values: Box::new(values),
-        }
-    }
-}
-
-impl StringValueInput {
-    /// Creates an unnamed compact string tensor.
-    pub fn new<I, S>(shape: impl Into<Vec<i64>>, values: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let shape = shape.into();
-        let values = string_input_values(&shape, values)?;
-        Ok(Self { shape, values })
-    }
-
-    /// Returns the tensor shape.
-    pub fn shape(&self) -> &[i64] {
-        &self.shape
-    }
-}
-
-impl<'a> SequenceInput<'a> {
-    /// Creates a named sequence input.
-    pub fn new(name: &str, values: impl IntoIterator<Item = InputValue<'a>>) -> Result<Self> {
-        Ok(Self {
-            name: cstring(name, "input")?,
-            values: values.into_iter().collect(),
-        })
-    }
-
-    /// Returns the input name.
-    pub fn name(&self) -> &CStr {
-        &self.name
-    }
-}
-
-impl<'a> MapInput<'a> {
-    /// Creates a named map input from its key and value components.
-    pub fn new(name: &str, keys: InputValue<'a>, values: InputValue<'a>) -> Result<Self> {
-        Ok(Self {
-            name: cstring(name, "input")?,
-            keys,
-            values,
-        })
-    }
-
-    /// Returns the input name.
-    pub fn name(&self) -> &CStr {
-        &self.name
-    }
-}
-
-/// A heterogeneous model input accepted by [`crate::session::Session::run_values`].
-pub enum ValueInput<'a> {
-    /// A borrowed compact CPU DLPack tensor.
-    Tensor(Input<'a>),
-    /// An owned string tensor.
-    Strings(StringInput),
-    /// A named sequence.
-    Sequence(SequenceInput<'a>),
-    /// A named map.
-    Map(MapInput<'a>),
-}
-
-impl ValueInput<'_> {
-    pub(super) fn name(&self) -> &CStr {
-        match self {
-            Self::Tensor(input) => input.name(),
-            Self::Strings(input) => input.name(),
-            Self::Sequence(input) => input.name(),
-            Self::Map(input) => input.name(),
-        }
-    }
-}
-
-impl Output {
-    /// Returns the model output name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Borrows the owning DLPack handle.
-    pub fn tensor(&self) -> &versioned::Dlpack {
-        &self.tensor
-    }
-
-    /// Consumes the named output and returns its DLPack handle.
-    pub fn into_dlpack(self) -> versioned::Dlpack {
-        self.tensor
-    }
-}
-
-/// A named, validated DLPack input borrowed by a session run.
-pub struct Input<'a> {
-    pub(super) name: CString,
-    pub(super) tensor: TensorRef<'a>,
-}
-
-/// A named caller-owned DLPack tensor used as an inference output buffer.
-pub struct OutputBuffer<'a> {
-    pub(super) name: CString,
-    pub(super) tensor: TensorMut<'a>,
-}
-
-/// A named compact CPU or CUDA DLPack input for ORT I/O Binding.
-pub struct IoBindingInput<'a> {
-    pub(super) name: CString,
-    pub(super) tensor: TensorRef<'a>,
-}
-
-/// A named writable compact CPU or CUDA DLPack output for ORT I/O Binding.
-pub struct IoBindingOutput<'a> {
-    pub(super) name: CString,
-    pub(super) tensor: TensorMut<'a>,
-}
-
-/// A named output whose allocation and dynamic shape are selected by ORT.
-#[derive(Debug, Clone)]
-pub struct IoBindingDeviceOutput {
-    pub(super) name: CString,
-    pub(super) device: DLDevice,
-}
-
-impl IoBindingDeviceOutput {
-    /// Requests an ORT-allocated CUDA output on `device_id`.
-    pub fn cuda(name: &str, device_id: i32) -> Result<Self> {
-        ensure!(
-            device_id >= 0,
-            UnsupportedIoBindingDeviceSnafu {
-                device_type: DLDeviceType::CUDA,
+impl MemoryInfo {
+    /// Creates a memory descriptor for an execution-provider allocator.
+    pub fn new(
+        environment: Environment,
+        name: &str,
+        allocator_type: AllocatorType,
+        device_id: i32,
+        memory_type: MemoryType,
+    ) -> Result<Self> {
+        let name = cstring(name, "memory info name")?;
+        let api = &environment.inner.api;
+        let mut memory_info = ptr::null_mut();
+        // SAFETY: the name and output storage remain live for the call and all
+        // enum values have valid ONNX Runtime representations.
+        status_call!(
+            api,
+            CreateMemoryInfo(
+                name.as_ptr(),
+                allocator_type.into(),
                 device_id,
-            }
-        );
+                memory_type.into(),
+                &mut memory_info,
+            )
+        )?;
         Ok(Self {
-            name: cstring(name, "I/O Binding device output")?,
-            device: DLDevice {
-                device_type: DLDeviceType::CUDA,
-                device_id,
-            },
+            environment,
+            memory_info: NonNull::new(require_non_null(memory_info, "memory info")?)
+                .expect("require_non_null returned a non-null pointer"),
         })
     }
 
-    /// Requests an ORT-allocated CPU output.
-    pub fn cpu(name: &str) -> Result<Self> {
-        Ok(Self {
-            name: cstring(name, "I/O Binding device output")?,
-            device: DLDevice::CPU,
-        })
-    }
-
-    /// Returns the output name.
-    pub fn name(&self) -> &CStr {
-        &self.name
-    }
-
-    /// Returns the requested DLPack device.
-    pub fn device(&self) -> DLDevice {
-        self.device
-    }
-}
-
-impl<'a> IoBindingInput<'a> {
-    /// Validates and borrows a CPU or CUDA DLPack tensor without copying it.
-    pub fn from_dlpack<M>(name: &str, tensor: &'a Managed<M>) -> Result<Self>
-    where
-        M: ManagedTensorBase,
-    {
-        let flags = tensor.flags();
-        let tensor = tensor
-            .validate()
-            .map_err(|source| Error::DlpackTensor { source })?;
-        validate_iobinding_compact(&tensor)?;
-        validate_dlpack_flags(flags, tensor.dtype())?;
-        dlpack_to_onnx(tensor.dtype())?;
-        Ok(Self {
-            name: cstring(name, "I/O Binding input")?,
-            tensor,
-        })
-    }
-
-    /// Returns the input name.
-    pub fn name(&self) -> &CStr {
-        &self.name
-    }
-
-    /// Returns the DLPack device of the bound input.
-    pub fn device(&self) -> DLDevice {
-        self.tensor.device()
-    }
-}
-
-impl<'a> IoBindingOutput<'a> {
-    /// Exclusively borrows a writable CPU or CUDA DLPack output without copying it.
-    pub fn from_dlpack<M>(name: &str, tensor: &'a mut Managed<M>) -> Result<Self>
-    where
-        M: ManagedTensorBase,
-    {
-        let flags = tensor.flags();
-        let tensor = tensor
-            .validate_mut()
-            .map_err(|source| Error::DlpackTensor { source })?;
-        validate_iobinding_compact(&tensor)?;
-        validate_dlpack_flags(flags, tensor.dtype())?;
-        dlpack_to_onnx(tensor.dtype())?;
-        Ok(Self {
-            name: cstring(name, "I/O Binding output")?,
-            tensor,
-        })
-    }
-
-    /// Returns the output name.
-    pub fn name(&self) -> &CStr {
-        &self.name
-    }
-
-    /// Returns the DLPack device of the bound output.
-    pub fn device(&self) -> DLDevice {
-        self.tensor.device()
-    }
-}
-
-impl<'a> OutputBuffer<'a> {
-    /// Exclusively borrows and validates a writable compact CPU DLPack tensor.
-    pub fn from_dlpack<M>(name: &str, tensor: &'a mut Managed<M>) -> Result<Self>
-    where
-        M: ManagedTensorBase,
-    {
-        let flags = tensor.flags();
-        let tensor = tensor
-            .validate_mut()
-            .map_err(|source| Error::DlpackTensor { source })?;
-        validate_cpu_compact(&tensor)?;
-        validate_dlpack_flags(flags, tensor.dtype())?;
-        dlpack_to_onnx(tensor.dtype())?;
-        Ok(Self {
-            name: cstring(name, "output")?,
-            tensor,
-        })
-    }
-
-    /// Returns the output name.
-    pub fn name(&self) -> &CStr {
-        &self.name
-    }
-}
-
-impl<'a> Input<'a> {
-    /// Validates and borrows a legacy or versioned DLPack tensor.
-    pub fn from_dlpack<M>(name: &str, tensor: &'a Managed<M>) -> Result<Self>
-    where
-        M: ManagedTensorBase,
-    {
-        let flags = tensor.flags();
-        let tensor = tensor
-            .validate()
-            .map_err(|source| Error::DlpackTensor { source })?;
-        validate_cpu_compact(&tensor)?;
-        validate_dlpack_flags(flags, tensor.dtype())?;
-        dlpack_to_onnx(tensor.dtype())?;
-        Ok(Self {
-            name: cstring(name, "input")?,
-            tensor,
-        })
-    }
-
-    /// Returns the input name.
-    pub fn name(&self) -> &CStr {
-        &self.name
-    }
-}
-
-pub(super) fn validate_cpu_compact(tensor: &impl TensorView) -> Result<()> {
-    let tensor = tensor.as_raw_tensor();
-    let device = tensor.device();
-    ensure!(
-        device.device_type == DLDeviceType::CPU && device.device_id == 0,
-        UnsupportedDeviceSnafu {
-            device_type: device.device_type,
-            device_id: device.device_id,
-        }
-    );
-    if !tensor
-        .is_compact()
-        .map_err(|source| Error::DlpackTensor { source })?
-    {
-        return Err(Error::DlpackTensor {
-            source: dlpark::tensor::Error::NonCompactStrides,
-        });
-    }
-    Ok(())
-}
-
-pub(super) fn validate_iobinding_compact(tensor: &impl TensorView) -> Result<()> {
-    let tensor = tensor.as_raw_tensor();
-    let device = tensor.device();
-    let supported = (device.device_type == DLDeviceType::CPU && device.device_id == 0)
-        || (device.device_type == DLDeviceType::CUDA && device.device_id >= 0);
-    ensure!(
-        supported,
-        UnsupportedIoBindingDeviceSnafu {
-            device_type: device.device_type,
-            device_id: device.device_id,
-        }
-    );
-    if !tensor
-        .is_compact()
-        .map_err(|source| Error::DlpackTensor { source })?
-    {
-        return Err(Error::DlpackTensor {
-            source: dlpark::tensor::Error::NonCompactStrides,
-        });
-    }
-    Ok(())
-}
-
-pub(super) fn create_dlpack_memory_info(
-    api: &sys::Api,
-    device: DLDevice,
-) -> Result<*mut sys::OrtMemoryInfo> {
-    let mut memory_info = ptr::null_mut();
-    if device.device_type == DLDeviceType::CPU && device.device_id == 0 {
-        // SAFETY: output points to writable storage and enum values are valid.
+    /// Creates the standard CPU arena memory descriptor.
+    pub fn cpu(environment: Environment) -> Result<Self> {
+        let api = &environment.inner.api;
+        let mut memory_info = ptr::null_mut();
+        // SAFETY: output storage is writable and both enum values are valid.
         status_call!(
             api,
             CreateCpuMemoryInfo(
@@ -646,554 +153,1581 @@ pub(super) fn create_dlpack_memory_info(
                 &mut memory_info,
             )
         )?;
-    } else if device.device_type == DLDeviceType::CUDA && device.device_id >= 0 {
-        // SAFETY: `Cuda` is the allocator name required by ONNX Runtime for
-        // CUDA device allocations; output points to writable storage.
+        Ok(Self {
+            environment,
+            memory_info: NonNull::new(require_non_null(memory_info, "memory info")?)
+                .expect("require_non_null returned a non-null pointer"),
+        })
+    }
+
+    /// Creates a CUDA device-memory descriptor.
+    pub fn cuda(environment: Environment, device_id: i32) -> Result<Self> {
+        Self::new(
+            environment,
+            "Cuda",
+            AllocatorType::Device,
+            device_id,
+            MemoryType::Default,
+        )
+    }
+
+    /// Returns the native memory-info pointer.
+    pub fn as_ptr(&self) -> *const sys::OrtMemoryInfo {
+        self.memory_info.as_ptr()
+    }
+
+    /// Returns the allocator name retained by ONNX Runtime.
+    pub fn name(&self) -> Result<&CStr> {
+        let api = &self.environment.inner.api;
+        let mut name = ptr::null();
+        // SAFETY: the descriptor is live and output storage is writable.
+        status_call!(api, MemoryInfoGetName(self.as_ptr(), &mut name))?;
+        let name = require_non_null(name.cast_mut(), "memory info name")?;
+        // SAFETY: ONNX Runtime documents this string as valid for the lifetime
+        // of the descriptor, which is borrowed by the returned reference.
+        Ok(unsafe { CStr::from_ptr(name) })
+    }
+
+    /// Returns the allocator kind.
+    pub fn allocator_type(&self) -> Result<AllocatorType> {
+        memory_info_allocator_type(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns the execution-provider device identifier.
+    pub fn device_id(&self) -> Result<i32> {
+        memory_info_device_id(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns the execution-provider memory kind.
+    pub fn memory_type(&self) -> Result<MemoryType> {
+        memory_info_memory_type(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns the broad device category.
+    pub fn device_type(&self) -> DeviceType {
+        memory_info_device_type(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns a copied snapshot of all descriptor fields.
+    pub fn details(&self) -> Result<MemoryInfoDetails> {
+        memory_info_details(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Compares two descriptors using ONNX Runtime's native semantics.
+    pub fn is_equal(&self, other: &Self) -> Result<bool> {
+        ensure!(
+            Environment::same_runtime(&self.environment, &other.environment),
+            ForeignEnvironmentSnafu
+        );
+        let api = &self.environment.inner.api;
+        let mut comparison = -1;
+        // SAFETY: both descriptors are live and the output storage is writable.
         status_call!(
             api,
-            CreateMemoryInfo(
-                c"Cuda".as_ptr(),
-                sys::OrtAllocatorType::OrtDeviceAllocator,
-                device.device_id,
-                sys::OrtMemType::OrtMemTypeDefault,
-                &mut memory_info,
+            CompareMemoryInfo(self.as_ptr(), other.as_ptr(), &mut comparison)
+        )?;
+        Ok(comparison == 0)
+    }
+}
+
+impl Drop for MemoryInfo {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the live memory-info object.
+        unsafe {
+            api_function!(self.environment.inner.api, ReleaseMemoryInfo)(self.memory_info.as_ptr())
+        };
+    }
+}
+
+/// A session allocator for a specific memory descriptor.
+///
+/// Values allocated through this object borrow it because ONNX Runtime keeps
+/// calling the native allocator until the value is released.
+pub struct Allocator<'session> {
+    session: &'session Session,
+    allocator: NonNull<sys::OrtAllocator>,
+}
+
+impl Allocator<'_> {
+    /// Returns the native allocator pointer.
+    pub fn as_ptr(&self) -> *mut sys::OrtAllocator {
+        self.allocator.as_ptr()
+    }
+
+    /// Returns a copied snapshot of the allocator's memory descriptor.
+    pub fn memory_info(&self) -> Result<MemoryInfoDetails> {
+        let api = &self.session.environment.inner.api;
+        let mut memory_info = ptr::null();
+        // SAFETY: the allocator is live and output storage is writable.
+        status_call!(api, AllocatorGetInfo(self.as_ptr(), &mut memory_info))?;
+        let memory_info = require_non_null(memory_info.cast_mut(), "allocator memory info")?;
+        memory_info_details(api, memory_info)
+    }
+}
+
+impl Drop for Allocator<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the live session allocator.
+        unsafe {
+            api_function!(self.session.environment.inner.api, ReleaseAllocator)(self.as_ptr())
+        };
+    }
+}
+
+/// Native allocator strategy recorded in [`MemoryInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatorType {
+    /// Allocations are made directly by the device allocator.
+    Device,
+    /// Allocations are served from an arena.
+    Arena,
+}
+
+impl From<AllocatorType> for sys::OrtAllocatorType {
+    fn from(value: AllocatorType) -> Self {
+        match value {
+            AllocatorType::Device => Self::OrtDeviceAllocator,
+            AllocatorType::Arena => Self::OrtArenaAllocator,
+        }
+    }
+}
+
+/// Execution-provider memory usage recorded in [`MemoryInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryType {
+    /// CPU memory consumed by a non-CPU execution provider.
+    CpuInput,
+    /// CPU-accessible memory produced by a non-CPU execution provider.
+    CpuOutput,
+    /// The execution provider's default memory.
+    Default,
+}
+
+impl From<MemoryType> for sys::OrtMemType {
+    fn from(value: MemoryType) -> Self {
+        match value {
+            MemoryType::CpuInput => Self::OrtMemTypeCPUInput,
+            MemoryType::CpuOutput => Self::OrtMemTypeCPUOutput,
+            MemoryType::Default => Self::OrtMemTypeDefault,
+        }
+    }
+}
+
+/// Broad device category associated with tensor storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeviceType {
+    /// Host CPU memory.
+    Cpu,
+    /// GPU memory.
+    Gpu,
+    /// FPGA memory.
+    Fpga,
+    /// A device category introduced by a newer runtime.
+    Unknown(u32),
+}
+
+/// Copied fields from an ONNX Runtime memory descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryInfoDetails {
+    /// Allocator or execution-provider name.
+    pub name: String,
+    /// Native allocation strategy.
+    pub allocator_type: AllocatorType,
+    /// Execution-provider device identifier.
+    pub device_id: i32,
+    /// Execution-provider memory usage.
+    pub memory_type: MemoryType,
+    /// Broad device category.
+    pub device_type: DeviceType,
+}
+
+/// Rust element types that have an unambiguous ONNX tensor representation.
+pub trait TensorElement: private::Sealed + 'static {
+    /// Corresponding ONNX tensor element type.
+    const ELEMENT_TYPE: ElementType;
+}
+
+macro_rules! tensor_elements {
+    ($($rust:ty => $element:ident),+ $(,)?) => {
+        $(
+            impl private::Sealed for $rust {}
+            impl TensorElement for $rust {
+                const ELEMENT_TYPE: ElementType = ElementType::$element;
+            }
+        )+
+    };
+}
+
+tensor_elements! {
+    f32 => Float32,
+    f64 => Float64,
+    i8 => Int8,
+    i16 => Int16,
+    i32 => Int32,
+    i64 => Int64,
+    u8 => Uint8,
+    u16 => Uint16,
+    u32 => Uint32,
+    u64 => Uint64,
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// An owned `OrtValue` that may borrow externally managed tensor storage.
+pub struct Value<'buffer> {
+    environment: Environment,
+    value: NonNull<sys::OrtValue>,
+    _buffer: PhantomData<&'buffer mut [u8]>,
+}
+
+impl<'buffer> Value<'buffer> {
+    pub(super) fn environment(&self) -> &Environment {
+        &self.environment
+    }
+
+    /// Creates a tensor backed directly by a mutable Rust slice.
+    pub fn tensor<T: TensorElement>(
+        environment: Environment,
+        memory_info: &MemoryInfo,
+        data: &'buffer mut [T],
+        shape: impl AsRef<[i64]>,
+    ) -> Result<Self> {
+        ensure!(
+            Environment::same_runtime(&environment, &memory_info.environment),
+            ForeignEnvironmentSnafu
+        );
+        ensure!(
+            memory_info.device_type() == DeviceType::Cpu,
+            NonCpuMemorySnafu
+        );
+        let shape = shape.as_ref();
+        let expected = element_count(shape)?;
+        ensure!(
+            expected == data.len(),
+            ElementCountSnafu {
+                expected,
+                actual: data.len()
+            }
+        );
+        let byte_len = size_of_val(data);
+        let data =
+            NonNull::new(data.as_mut_ptr().cast::<c_void>()).unwrap_or_else(NonNull::dangling);
+        // SAFETY: the mutable slice is retained by the returned lifetime, has
+        // exactly the shape's element count, and its byte size is correct.
+        unsafe {
+            Self::from_raw_parts(
+                environment,
+                memory_info,
+                data,
+                byte_len,
+                shape,
+                T::ELEMENT_TYPE,
+            )
+        }
+    }
+
+    /// Creates a tensor over arbitrary external storage.
+    ///
+    /// # Safety
+    ///
+    /// `data` must remain valid, correctly aligned, and writable for
+    /// `byte_len` bytes for the returned lifetime. The allocation must reside
+    /// in the device described by `memory_info`, and `shape`/`element_type`
+    /// must accurately describe the storage.
+    pub unsafe fn from_raw_parts(
+        environment: Environment,
+        memory_info: &MemoryInfo,
+        data: NonNull<c_void>,
+        byte_len: usize,
+        shape: &[i64],
+        element_type: ElementType,
+    ) -> Result<Self> {
+        ensure!(
+            Environment::same_runtime(&environment, &memory_info.environment),
+            ForeignEnvironmentSnafu
+        );
+        let api = &memory_info.environment.inner.api;
+        let mut value = ptr::null_mut();
+        // SAFETY: upheld by this function's caller; all descriptor arrays stay
+        // live for the duration of the native constructor call.
+        status_call!(
+            api,
+            CreateTensorWithDataAsOrtValue(
+                memory_info.as_ptr(),
+                data.as_ptr(),
+                byte_len,
+                shape.as_ptr(),
+                shape.len(),
+                to_native_element_type(element_type),
+                &mut value,
             )
         )?;
-    } else {
-        return Err(Error::UnsupportedIoBindingDevice {
-            device_type: device.device_type,
-            device_id: device.device_id,
-        });
+        Ok(Self {
+            environment,
+            value: NonNull::new(require_non_null(value, "tensor value")?)
+                .expect("require_non_null returned a non-null pointer"),
+            _buffer: PhantomData,
+        })
     }
-    Ok(require_non_null(memory_info, "DLPack memory info")?)
+
+    /// Allocates a tensor from a session allocator.
+    ///
+    /// The returned value borrows `allocator`; the allocator must remain live
+    /// because ONNX Runtime uses it to release the tensor storage.
+    pub fn allocate_tensor_in<T: TensorElement>(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        shape: impl AsRef<[i64]>,
+    ) -> Result<Self> {
+        Self::allocate_tensor_in_with_type(environment, allocator, shape, T::ELEMENT_TYPE)
+    }
+
+    /// Allocates a tensor from a session allocator with an explicit type.
+    pub fn allocate_tensor_in_with_type(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        shape: impl AsRef<[i64]>,
+        element_type: ElementType,
+    ) -> Result<Self> {
+        ensure!(
+            Environment::same_runtime(&environment, &allocator.session.environment),
+            ForeignEnvironmentSnafu
+        );
+        let shape = shape.as_ref();
+        element_count(shape)?;
+        let api = &environment.inner.api;
+        let mut value = ptr::null_mut();
+        // SAFETY: allocator is retained through the returned lifetime, shape
+        // remains live for the call, and output storage is writable.
+        status_call!(
+            api,
+            CreateTensorAsOrtValue(
+                allocator.as_ptr(),
+                shape.as_ptr(),
+                shape.len(),
+                to_native_element_type(element_type),
+                &mut value,
+            )
+        )?;
+        Ok(Self {
+            environment,
+            value: NonNull::new(require_non_null(value, "allocated tensor value")?)
+                .expect("require_non_null returned a non-null pointer"),
+            _buffer: PhantomData,
+        })
+    }
+
+    /// Creates an allocator-owned COO sparse tensor by copying CPU slices.
+    pub fn sparse_coo<T: TensorElement>(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        source_memory: &MemoryInfo,
+        dense_shape: impl AsRef<[i64]>,
+        values_shape: impl AsRef<[i64]>,
+        values: &[T],
+        indices: &[i64],
+    ) -> Result<Self> {
+        let values_shape = values_shape.as_ref();
+        validate_sparse_source(
+            &environment,
+            allocator,
+            source_memory,
+            values_shape,
+            values.len(),
+        )?;
+        let mut value = Self::allocate_sparse(
+            environment,
+            allocator,
+            dense_shape.as_ref(),
+            T::ELEMENT_TYPE,
+        )?;
+        let value_ptr = value.as_mut_ptr();
+        let api = &value.environment.inner.api;
+        // SAFETY: source slices and descriptor are CPU-resident and live for
+        // this copying call; value is an empty allocator-owned sparse tensor.
+        status_call!(
+            api,
+            FillSparseTensorCoo(
+                value_ptr,
+                source_memory.as_ptr(),
+                values_shape.as_ptr(),
+                values_shape.len(),
+                values.as_ptr().cast(),
+                indices.as_ptr(),
+                indices.len(),
+            )
+        )?;
+        Ok(value)
+    }
+
+    /// Creates an allocator-owned CSR sparse tensor by copying CPU slices.
+    pub fn sparse_csr<T: TensorElement>(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        source_memory: &MemoryInfo,
+        dense_shape: impl AsRef<[i64]>,
+        values_shape: impl AsRef<[i64]>,
+        values: &[T],
+        indices: CsrIndices<'_>,
+    ) -> Result<Self> {
+        let values_shape = values_shape.as_ref();
+        validate_sparse_source(
+            &environment,
+            allocator,
+            source_memory,
+            values_shape,
+            values.len(),
+        )?;
+        let mut value = Self::allocate_sparse(
+            environment,
+            allocator,
+            dense_shape.as_ref(),
+            T::ELEMENT_TYPE,
+        )?;
+        let value_ptr = value.as_mut_ptr();
+        let api = &value.environment.inner.api;
+        // SAFETY: all source slices are CPU-resident and copied synchronously.
+        status_call!(
+            api,
+            FillSparseTensorCsr(
+                value_ptr,
+                source_memory.as_ptr(),
+                values_shape.as_ptr(),
+                values_shape.len(),
+                values.as_ptr().cast(),
+                indices.inner.as_ptr(),
+                indices.inner.len(),
+                indices.outer.as_ptr(),
+                indices.outer.len(),
+            )
+        )?;
+        Ok(value)
+    }
+
+    /// Creates an allocator-owned block-sparse tensor by copying CPU slices.
+    pub fn sparse_block<T: TensorElement>(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        source_memory: &MemoryInfo,
+        dense_shape: impl AsRef<[i64]>,
+        values_shape: impl AsRef<[i64]>,
+        values: &[T],
+        indices: BlockSparseIndices<'_>,
+    ) -> Result<Self> {
+        let values_shape = values_shape.as_ref();
+        validate_sparse_source(
+            &environment,
+            allocator,
+            source_memory,
+            values_shape,
+            values.len(),
+        )?;
+        let expected_indices = element_count(indices.shape)?;
+        ensure!(
+            expected_indices == indices.values.len(),
+            ElementCountSnafu {
+                expected: expected_indices,
+                actual: indices.values.len()
+            }
+        );
+        let mut value = Self::allocate_sparse(
+            environment,
+            allocator,
+            dense_shape.as_ref(),
+            T::ELEMENT_TYPE,
+        )?;
+        let value_ptr = value.as_mut_ptr();
+        let api = &value.environment.inner.api;
+        // SAFETY: all source slices are CPU-resident and copied synchronously.
+        status_call!(
+            api,
+            FillSparseTensorBlockSparse(
+                value_ptr,
+                source_memory.as_ptr(),
+                values_shape.as_ptr(),
+                values_shape.len(),
+                values.as_ptr().cast(),
+                indices.shape.as_ptr(),
+                indices.shape.len(),
+                indices.values.as_ptr(),
+            )
+        )?;
+        Ok(value)
+    }
+
+    fn allocate_sparse(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        dense_shape: &[i64],
+        element_type: ElementType,
+    ) -> Result<Self> {
+        ensure!(
+            Environment::same_runtime(&environment, &allocator.session.environment),
+            ForeignEnvironmentSnafu
+        );
+        element_count(dense_shape)?;
+        let api = &environment.inner.api;
+        let mut value = ptr::null_mut();
+        // SAFETY: allocator is retained through the returned lifetime, shape
+        // is valid for the call, and output storage is writable.
+        status_call!(
+            api,
+            CreateSparseTensorAsOrtValue(
+                allocator.as_ptr(),
+                dense_shape.as_ptr(),
+                dense_shape.len(),
+                to_native_element_type(element_type),
+                &mut value,
+            )
+        )?;
+        Ok(Self {
+            environment,
+            value: NonNull::new(require_non_null(value, "sparse tensor value")?)
+                .expect("require_non_null returned a non-null pointer"),
+            _buffer: PhantomData,
+        })
+    }
+
+    /// Adopts an owned native value returned by the same environment.
+    ///
+    /// # Safety
+    ///
+    /// `value` must be a uniquely owned live `OrtValue` created by
+    /// `environment`. Ownership is transferred to the returned wrapper.
+    pub unsafe fn from_raw_owned(environment: Environment, value: NonNull<sys::OrtValue>) -> Self {
+        Self {
+            environment,
+            value,
+            _buffer: PhantomData,
+        }
+    }
+
+    /// Returns the native value pointer for read-only FFI calls.
+    pub fn as_ptr(&self) -> *const sys::OrtValue {
+        self.value.as_ptr()
+    }
+
+    /// Returns the native value pointer for calls that may mutate the value.
+    pub fn as_mut_ptr(&mut self) -> *mut sys::OrtValue {
+        self.value.as_ptr()
+    }
+
+    /// Returns whether this value is a dense tensor.
+    pub fn is_tensor(&self) -> Result<bool> {
+        let api = &self.environment.inner.api;
+        let mut is_tensor = 0;
+        // SAFETY: the value is live and output storage is writable.
+        status_call!(api, IsTensor(self.as_ptr(), &mut is_tensor))?;
+        Ok(is_tensor != 0)
+    }
+
+    /// Returns whether this value is a sparse tensor.
+    pub fn is_sparse_tensor(&self) -> Result<bool> {
+        let api = &self.environment.inner.api;
+        let mut is_sparse = 0;
+        // SAFETY: the value is live and output storage is writable.
+        status_call!(api, IsSparseTensor(self.as_ptr(), &mut is_sparse))?;
+        Ok(is_sparse != 0)
+    }
+
+    /// Returns the ONNX value category.
+    pub fn value_type(&self) -> Result<ValueType> {
+        let api = &self.environment.inner.api;
+        let mut value_type = sys::ONNXType::ONNX_TYPE_UNKNOWN;
+        // SAFETY: the value is live and output storage is writable.
+        status_call!(api, GetValueType(self.as_ptr(), &mut value_type))?;
+        Ok(value_type.into())
+    }
+
+    /// Returns the child count of a sequence, map, or optional value.
+    pub fn value_count(&self) -> Result<usize> {
+        let api = &self.environment.inner.api;
+        let mut count = 0;
+        // SAFETY: the value is live and output storage is writable. ORT
+        // validates that this value category supports child access.
+        status_call!(api, GetValueCount(self.as_ptr(), &mut count))?;
+        Ok(count)
+    }
+
+    /// Copies one child from a sequence, map, or optional value.
+    ///
+    /// ONNX Runtime uses its process-lifetime default CPU allocator for the
+    /// returned value, so the child does not borrow its parent.
+    pub fn value_at(&self, index: usize) -> Result<Value<'static>> {
+        let index = i32::try_from(index).map_err(|_| Error::ContainerIndexOverflow { index })?;
+        let api = &self.environment.inner.api;
+        let allocator = ffi::default_allocator(api)?;
+        let mut value = ptr::null_mut();
+        // SAFETY: the parent and allocator are live and output storage is
+        // writable. ORT validates the index against the container.
+        status_call!(api, GetValue(self.as_ptr(), index, allocator, &mut value))?;
+        let value = NonNull::new(require_non_null(value, "container child value")?)
+            .expect("require_non_null returned a non-null pointer");
+        // SAFETY: GetValue transfers unique ownership of the copied child.
+        Ok(unsafe { Value::from_raw_owned(self.environment.clone(), value) })
+    }
+
+    /// Returns the tensor element type and shape.
+    pub fn tensor_info(&self) -> Result<TensorInfo> {
+        ensure!(self.is_tensor()?, NotTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut info = ptr::null_mut();
+        // SAFETY: the value is a live tensor and output storage is writable.
+        status_call!(api, GetTensorTypeAndShape(self.as_ptr(), &mut info))?;
+        let info = require_non_null(info, "tensor shape info")?;
+        let guard = ShapeInfoGuard { api, info };
+
+        tensor_info_from_shape(api, guard.info)
+    }
+
+    /// Returns the sparse storage format.
+    pub fn sparse_format(&self) -> Result<SparseFormat> {
+        ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut format = sys::OrtSparseFormat::ORT_SPARSE_UNDEFINED;
+        // SAFETY: the sparse value is live and output storage is writable.
+        status_call!(api, GetSparseTensorFormat(self.as_ptr(), &mut format))?;
+        Ok(format.into())
+    }
+
+    /// Returns the element type and shape of the non-zero values array.
+    pub fn sparse_values_info(&self) -> Result<TensorInfo> {
+        ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut info = ptr::null_mut();
+        // SAFETY: the sparse value is live and output storage is writable.
+        status_call!(
+            api,
+            GetSparseTensorValuesTypeAndShape(self.as_ptr(), &mut info)
+        )?;
+        let info = require_non_null(info, "sparse values shape info")?;
+        let guard = ShapeInfoGuard { api, info };
+        tensor_info_from_shape(api, guard.info)
+    }
+
+    /// Borrows sparse non-zero values as a typed slice.
+    ///
+    /// # Safety
+    ///
+    /// The sparse values allocation must be CPU-accessible. ONNX Runtime 1.21
+    /// cannot report `OrtMemoryInfo` for a sparse value, so this cannot be
+    /// checked dynamically.
+    pub unsafe fn sparse_values<T: TensorElement>(&self) -> Result<&[T]> {
+        let info = self.sparse_values_info()?;
+        ensure!(
+            info.element_type == T::ELEMENT_TYPE,
+            ElementTypeMismatchSnafu {
+                expected: T::ELEMENT_TYPE,
+                actual: info.element_type
+            }
+        );
+        let length = element_count(&info.shape)?;
+        let api = &self.environment.inner.api;
+        let mut data = ptr::null();
+        // SAFETY: the sparse value is live and output storage is writable.
+        status_call!(api, GetSparseTensorValues(self.as_ptr(), &mut data))?;
+        if length == 0 {
+            return Ok(&[]);
+        }
+        let data = require_non_null(data.cast_mut().cast::<T>(), "sparse values")?;
+        ensure!(data.align_offset(align_of::<T>()) == 0, MisalignedDataSnafu);
+        // SAFETY: ORT reports the values shape and owns the storage for self's lifetime.
+        Ok(unsafe { slice::from_raw_parts(data, length) })
+    }
+
+    /// Returns metadata for one sparse-index array.
+    pub fn sparse_indices_info(&self, indices: SparseIndices) -> Result<TensorInfo> {
+        ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut info = ptr::null_mut();
+        // SAFETY: the sparse value is live and output storage is writable.
+        status_call!(
+            api,
+            GetSparseTensorIndicesTypeShape(self.as_ptr(), indices.into(), &mut info)
+        )?;
+        let info = require_non_null(info, "sparse indices shape info")?;
+        let guard = ShapeInfoGuard { api, info };
+        tensor_info_from_shape(api, guard.info)
+    }
+
+    /// Borrows COO indices from CPU-accessible storage.
+    ///
+    /// # Safety
+    ///
+    /// The indices allocation must be CPU-accessible.
+    pub unsafe fn sparse_coo_indices(&self) -> Result<&[i64]> {
+        // SAFETY: delegated to this method's caller.
+        unsafe { self.sparse_indices(SparseIndices::Coo) }
+    }
+
+    /// Borrows CSR inner indices from CPU storage.
+    ///
+    /// # Safety
+    ///
+    /// The indices allocation must be CPU-accessible.
+    pub unsafe fn sparse_csr_inner_indices(&self) -> Result<&[i64]> {
+        // SAFETY: delegated to this method's caller.
+        unsafe { self.sparse_indices(SparseIndices::CsrInner) }
+    }
+
+    /// Borrows CSR outer indices from CPU storage.
+    ///
+    /// # Safety
+    ///
+    /// The indices allocation must be CPU-accessible.
+    pub unsafe fn sparse_csr_outer_indices(&self) -> Result<&[i64]> {
+        // SAFETY: delegated to this method's caller.
+        unsafe { self.sparse_indices(SparseIndices::CsrOuter) }
+    }
+
+    /// Borrows block-sparse indices from CPU storage.
+    ///
+    /// # Safety
+    ///
+    /// The indices allocation must be CPU-accessible.
+    pub unsafe fn sparse_block_indices(&self) -> Result<&[i32]> {
+        // SAFETY: delegated to this method's caller.
+        unsafe { self.sparse_indices(SparseIndices::Block) }
+    }
+
+    unsafe fn sparse_indices<T>(&self, indices: SparseIndices) -> Result<&[T]> {
+        let api = &self.environment.inner.api;
+        let mut length = 0;
+        let mut data = ptr::null();
+        // SAFETY: the sparse value is live and both outputs are writable.
+        status_call!(
+            api,
+            GetSparseTensorIndices(self.as_ptr(), indices.into(), &mut length, &mut data)
+        )?;
+        if length == 0 {
+            return Ok(&[]);
+        }
+        let data = require_non_null(data.cast_mut().cast::<T>(), "sparse indices")?;
+        ensure!(data.align_offset(align_of::<T>()) == 0, MisalignedDataSnafu);
+        // SAFETY: ORT reports length entries owned by self.
+        Ok(unsafe { slice::from_raw_parts(data, length) })
+    }
+
+    /// Returns a copied snapshot of this tensor's memory descriptor.
+    pub fn memory_info(&self) -> Result<MemoryInfoDetails> {
+        ensure!(self.is_tensor()?, NotTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut memory_info = ptr::null();
+        // SAFETY: the value is live and output storage is writable.
+        status_call!(api, GetTensorMemoryInfo(self.as_ptr(), &mut memory_info))?;
+        let memory_info = require_non_null(memory_info.cast_mut(), "tensor memory info")?;
+        memory_info_details(api, memory_info)
+    }
+
+    /// Borrows CPU tensor storage as a typed slice.
+    pub fn as_slice<T: TensorElement>(&self) -> Result<&[T]> {
+        let (pointer, length) = self.typed_data::<T>()?;
+        // SAFETY: typed_data validated CPU placement, type, alignment, and
+        // element count. The borrow is tied to this live value.
+        Ok(unsafe { slice::from_raw_parts(pointer.cast_const(), length) })
+    }
+
+    /// Exclusively borrows CPU tensor storage as a typed mutable slice.
+    pub fn as_slice_mut<T: TensorElement>(&mut self) -> Result<&mut [T]> {
+        let (pointer, length) = self.typed_data::<T>()?;
+        // SAFETY: &mut self ensures exclusive access for the returned borrow.
+        Ok(unsafe { slice::from_raw_parts_mut(pointer, length) })
+    }
+
+    fn typed_data<T: TensorElement>(&self) -> Result<(*mut T, usize)> {
+        let info = self.tensor_info()?;
+        ensure!(
+            info.element_type == T::ELEMENT_TYPE,
+            ElementTypeMismatchSnafu {
+                expected: T::ELEMENT_TYPE,
+                actual: info.element_type
+            }
+        );
+        ensure!(self.is_cpu_tensor()?, NonCpuMemorySnafu);
+        let mut data = ptr::null_mut();
+        let api = &self.environment.inner.api;
+        // SAFETY: the value is a dense tensor and output storage is writable.
+        status_call!(api, GetTensorMutableData(self.value.as_ptr(), &mut data))?;
+        let data = require_non_null(data.cast::<T>(), "tensor data")?;
+        ensure!(data.align_offset(align_of::<T>()) == 0, MisalignedDataSnafu);
+        Ok((data, element_count(&info.shape)?))
+    }
+
+    fn is_cpu_tensor(&self) -> Result<bool> {
+        let api = &self.environment.inner.api;
+        let mut memory_info = ptr::null();
+        // SAFETY: the value is live and output storage is writable.
+        status_call!(api, GetTensorMemoryInfo(self.as_ptr(), &mut memory_info))?;
+        let memory_info = require_non_null(memory_info.cast_mut(), "tensor memory info")?;
+        let mut device_type = sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU;
+        // SAFETY: borrowed memory info remains valid for the value lifetime.
+        unsafe { api_function!(api, MemoryInfoGetDeviceType)(memory_info, &mut device_type) };
+        Ok(device_type == sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU)
+    }
+
+    /// Releases Rust ownership and returns the native pointer.
+    pub fn into_raw(self) -> *mut sys::OrtValue {
+        let pointer = self.value.as_ptr();
+        std::mem::forget(self);
+        pointer
+    }
 }
 
-pub(super) fn create_external_tensor(
+impl Value<'static> {
+    /// Allocates a tensor owned by ONNX Runtime using its default CPU allocator.
+    pub fn allocate_tensor<T: TensorElement>(
+        environment: Environment,
+        shape: impl AsRef<[i64]>,
+    ) -> Result<Self> {
+        Self::allocate_tensor_with_type(environment, shape, T::ELEMENT_TYPE)
+    }
+
+    /// Allocates a tensor with an explicitly selected ONNX element type.
+    pub fn allocate_tensor_with_type(
+        environment: Environment,
+        shape: impl AsRef<[i64]>,
+        element_type: ElementType,
+    ) -> Result<Self> {
+        let shape = shape.as_ref();
+        element_count(shape)?;
+        let api = &environment.inner.api;
+        let allocator = ffi::default_allocator(api)?;
+        let mut value = ptr::null_mut();
+        // SAFETY: the default allocator has process lifetime, shape remains
+        // live for the call, and output storage is writable.
+        status_call!(
+            api,
+            CreateTensorAsOrtValue(
+                allocator,
+                shape.as_ptr(),
+                shape.len(),
+                to_native_element_type(element_type),
+                &mut value,
+            )
+        )?;
+        let value = NonNull::new(require_non_null(value, "allocated tensor value")?)
+            .expect("require_non_null returned a non-null pointer");
+        // SAFETY: CreateTensorAsOrtValue transfers unique ownership to us.
+        Ok(unsafe { Self::from_raw_owned(environment, value) })
+    }
+}
+
+impl Drop for Value<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the live OrtValue.
+        unsafe { api_function!(self.environment.inner.api, ReleaseValue)(self.value.as_ptr()) };
+    }
+}
+
+/// Tensor metadata queried from an `OrtValue`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorInfo {
+    /// Tensor element type.
+    pub element_type: ElementType,
+    /// Concrete tensor dimensions.
+    pub shape: Vec<i64>,
+}
+
+/// ONNX category stored in a [`Value`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ValueType {
+    /// The runtime did not identify the category.
+    Unknown,
+    /// A dense tensor.
+    Tensor,
+    /// A sequence of values.
+    Sequence,
+    /// A key/value map represented by two child values.
+    Map,
+    /// A runtime-specific opaque value.
+    Opaque,
+    /// A sparse tensor.
+    SparseTensor,
+    /// An optional value with zero or one child.
+    Optional,
+    /// A category introduced by a newer runtime.
+    Other(u32),
+}
+
+impl From<sys::ONNXType> for ValueType {
+    fn from(value: sys::ONNXType) -> Self {
+        match value {
+            sys::ONNXType::ONNX_TYPE_UNKNOWN => Self::Unknown,
+            sys::ONNXType::ONNX_TYPE_TENSOR => Self::Tensor,
+            sys::ONNXType::ONNX_TYPE_SEQUENCE => Self::Sequence,
+            sys::ONNXType::ONNX_TYPE_MAP => Self::Map,
+            sys::ONNXType::ONNX_TYPE_OPAQUE => Self::Opaque,
+            sys::ONNXType::ONNX_TYPE_SPARSETENSOR => Self::SparseTensor,
+            sys::ONNXType::ONNX_TYPE_OPTIONAL => Self::Optional,
+            value => Self::Other(value.0),
+        }
+    }
+}
+
+/// Sparse tensor storage format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SparseFormat {
+    /// Sparse format has not been populated yet.
+    Undefined,
+    /// Coordinate-list storage.
+    Coo,
+    /// Compressed sparse row storage.
+    Csr,
+    /// Block-sparse storage.
+    Block,
+    /// A format introduced by a newer runtime.
+    Other(u32),
+}
+
+impl From<sys::OrtSparseFormat> for SparseFormat {
+    fn from(value: sys::OrtSparseFormat) -> Self {
+        match value {
+            sys::OrtSparseFormat::ORT_SPARSE_UNDEFINED => Self::Undefined,
+            sys::OrtSparseFormat::ORT_SPARSE_COO => Self::Coo,
+            sys::OrtSparseFormat::ORT_SPARSE_CSRC => Self::Csr,
+            sys::OrtSparseFormat::ORT_SPARSE_BLOCK_SPARSE => Self::Block,
+            value => Self::Other(value.0),
+        }
+    }
+}
+
+/// One of the index arrays stored by a sparse tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseIndices {
+    /// COO linear or coordinate indices.
+    Coo,
+    /// CSR column indices.
+    CsrInner,
+    /// CSR row offsets.
+    CsrOuter,
+    /// Block-sparse indices.
+    Block,
+}
+
+/// CSR column indices and row offsets supplied together.
+#[derive(Debug, Clone, Copy)]
+pub struct CsrIndices<'a> {
+    /// Column index for every non-zero value.
+    pub inner: &'a [i64],
+    /// Row offsets, normally containing `rows + 1` entries.
+    pub outer: &'a [i64],
+}
+
+/// Shape and values of a block-sparse index tensor.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockSparseIndices<'a> {
+    /// Shape of the indices tensor.
+    pub shape: &'a [i64],
+    /// Flattened block indices.
+    pub values: &'a [i32],
+}
+
+impl From<SparseIndices> for sys::OrtSparseIndicesFormat {
+    fn from(value: SparseIndices) -> Self {
+        match value {
+            SparseIndices::Coo => Self::ORT_SPARSE_COO_INDICES,
+            SparseIndices::CsrInner => Self::ORT_SPARSE_CSR_INNER_INDICES,
+            SparseIndices::CsrOuter => Self::ORT_SPARSE_CSR_OUTER_INDICES,
+            SparseIndices::Block => Self::ORT_SPARSE_BLOCK_SPARSE_INDICES,
+        }
+    }
+}
+
+/// A named borrowed value supplied to [`Session::run`].
+pub struct Input<'value> {
+    name: CString,
+    value: NonNull<sys::OrtValue>,
+    environment: &'value Environment,
+}
+
+/// A named caller-owned value used as a preallocated session output.
+pub struct Output<'value> {
+    name: CString,
+    value: NonNull<sys::OrtValue>,
+    environment: &'value Environment,
+    _borrow: PhantomData<&'value mut sys::OrtValue>,
+}
+
+impl<'value> Output<'value> {
+    /// Creates a named preallocated output.
+    pub fn new<'buffer>(name: &str, value: &'value mut Value<'buffer>) -> Result<Self> {
+        Ok(Self {
+            name: cstring(name, "output")?,
+            value: value.value,
+            environment: &value.environment,
+            _borrow: PhantomData,
+        })
+    }
+
+    /// Returns the output name.
+    pub fn name(&self) -> &std::ffi::CStr {
+        &self.name
+    }
+
+    /// Returns the borrowed native value pointer.
+    pub fn value_ptr(&self) -> *mut sys::OrtValue {
+        self.value.as_ptr()
+    }
+
+    pub(super) fn environment(&self) -> &Environment {
+        self.environment
+    }
+}
+
+impl<'value> Input<'value> {
+    /// Creates a named input without copying its value.
+    pub fn new<'buffer>(name: &str, value: &'value Value<'buffer>) -> Result<Self> {
+        Ok(Self {
+            name: cstring(name, "input")?,
+            value: value.value,
+            environment: &value.environment,
+        })
+    }
+
+    /// Returns the input name.
+    pub fn name(&self) -> &std::ffi::CStr {
+        &self.name
+    }
+
+    /// Returns the borrowed native value pointer.
+    pub fn value_ptr(&self) -> *const sys::OrtValue {
+        self.value.as_ptr()
+    }
+
+    pub(super) fn environment(&self) -> &Environment {
+        self.environment
+    }
+}
+
+impl Session {
+    /// Returns the borrowed native session pointer.
+    pub fn as_ptr(&self) -> *const sys::OrtSession {
+        self.session as *const sys::OrtSession
+    }
+
+    /// Creates a session allocator for the requested memory location.
+    pub fn allocator<'session>(
+        &'session self,
+        memory_info: &MemoryInfo,
+    ) -> Result<Allocator<'session>> {
+        ensure!(
+            Environment::same_runtime(&self.environment, &memory_info.environment),
+            ForeignEnvironmentSnafu
+        );
+        let api = &self.environment.inner.api;
+        let mut allocator = ptr::null_mut();
+        // SAFETY: the session and descriptor are live and output storage is writable.
+        status_call!(
+            api,
+            CreateAllocator(self.as_ptr(), memory_info.as_ptr(), &mut allocator)
+        )?;
+        Ok(Allocator {
+            session: self,
+            allocator: NonNull::new(require_non_null(allocator, "session allocator")?)
+                .expect("require_non_null returned a non-null pointer"),
+        })
+    }
+
+    /// Runs the session with `OrtValue` inputs.
+    pub fn run(&self, inputs: &[Input<'_>], output_names: &[&str]) -> Result<Vec<Value<'static>>> {
+        self.run_impl(inputs, output_names, None)
+    }
+
+    /// Runs values with reusable run options.
+    pub fn run_with_options(
+        &self,
+        inputs: &[Input<'_>],
+        output_names: &[&str],
+        options: &RunOptions,
+    ) -> Result<Vec<Value<'static>>> {
+        ensure!(options.belongs_to(self), ForeignEnvironmentSnafu);
+        self.run_impl(inputs, output_names, Some(options))
+    }
+
+    /// Submits a run to ONNX Runtime's native asynchronous API.
+    ///
+    /// Dropping an unfinished future requests cancellation and waits for the
+    /// native callback before releasing any borrowed input value.
+    pub fn run_async<'a>(
+        &'a self,
+        inputs: &'a [Input<'a>],
+        output_names: &[&str],
+    ) -> Result<RunFuture<'a>> {
+        let options = self.run_options()?;
+        self.run_async_with_options(inputs, output_names, options)
+    }
+
+    /// Submits a native asynchronous run with owned reusable run options.
+    pub fn run_async_with_options<'a>(
+        &'a self,
+        inputs: &'a [Input<'a>],
+        output_names: &[&str],
+        options: RunOptions,
+    ) -> Result<RunFuture<'a>> {
+        ensure!(options.belongs_to(self), ForeignEnvironmentSnafu);
+        for input in inputs {
+            ensure!(
+                Environment::same_runtime(&self.environment, input.environment),
+                ForeignEnvironmentSnafu
+            );
+        }
+
+        let input_names = inputs
+            .iter()
+            .map(|input| input.name.clone())
+            .collect::<Vec<_>>();
+        let input_name_ptrs = input_names
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
+        let input_value_ptrs = inputs.iter().map(Input::value_ptr).collect::<Vec<_>>();
+        let output_names = output_names
+            .iter()
+            .map(|name| cstring(name, "output").map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let output_name_ptrs = output_names
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
+        let output_slots = vec![ptr::null_mut(); output_names.len()];
+        let api = &self.environment.inner.api;
+        let completion = Arc::new(AsyncCompletion::new(api.clone(), output_names.len()));
+        let mut future = RunFuture {
+            session: self,
+            environment: self.environment.clone(),
+            completion,
+            run_options: options,
+            _input_names: input_names,
+            input_name_ptrs,
+            input_value_ptrs,
+            _output_names: output_names,
+            output_name_ptrs,
+            output_slots,
+            _input_borrow: PhantomData,
+            finished: false,
+        };
+
+        let callback_state = Arc::into_raw(future.completion.clone());
+        // SAFETY: every pointer array is retained in the future, the input
+        // borrow lasts until callback completion, and callback_state contains
+        // exactly one strong Arc reference reclaimed by async_run_callback.
+        let status = unsafe {
+            api_function!(api, RunAsync)(
+                self.session as *mut sys::OrtSession,
+                future.run_options.as_ptr(),
+                future.input_name_ptrs.as_ptr(),
+                future.input_value_ptrs.as_ptr(),
+                future.input_value_ptrs.len(),
+                future.output_name_ptrs.as_ptr(),
+                future.output_name_ptrs.len(),
+                future.output_slots.as_mut_ptr(),
+                Some(async_run_callback),
+                callback_state.cast_mut().cast(),
+            )
+        };
+        if !status.is_null() {
+            // SAFETY: submission failed, so ORT will not invoke the callback.
+            unsafe { drop(Arc::from_raw(callback_state)) };
+            future.finished = true;
+            check_status(api, status)?;
+        }
+        Ok(future)
+    }
+
+    /// Runs with caller-owned, preallocated outputs.
+    pub fn run_into(&self, inputs: &[Input<'_>], outputs: &mut [Output<'_>]) -> Result<()> {
+        self.run_into_impl(inputs, outputs, None)
+    }
+
+    /// Runs with preallocated outputs and reusable run options.
+    pub fn run_into_with_options(
+        &self,
+        inputs: &[Input<'_>],
+        outputs: &mut [Output<'_>],
+        options: &RunOptions,
+    ) -> Result<()> {
+        ensure!(options.belongs_to(self), ForeignEnvironmentSnafu);
+        self.run_into_impl(inputs, outputs, Some(options))
+    }
+
+    fn run_impl(
+        &self,
+        inputs: &[Input<'_>],
+        output_names: &[&str],
+        options: Option<&RunOptions>,
+    ) -> Result<Vec<Value<'static>>> {
+        for input in inputs {
+            ensure!(
+                Environment::same_runtime(&self.environment, input.environment),
+                ForeignEnvironmentSnafu
+            );
+        }
+        let output_names = output_names
+            .iter()
+            .map(|name| cstring(name, "output").map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let input_names = inputs
+            .iter()
+            .map(|input| input.name.as_ptr())
+            .collect::<Vec<_>>();
+        let input_values = inputs.iter().map(Input::value_ptr).collect::<Vec<_>>();
+        let output_name_ptrs = output_names
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
+        let mut outputs = vec![ptr::null_mut(); output_names.len()];
+        let api = &self.environment.inner.api;
+        // SAFETY: pointer arrays have matching lengths and all referenced
+        // values and strings remain live for this synchronous call.
+        let status = unsafe {
+            api_function!(api, Run)(
+                self.session as *mut sys::OrtSession,
+                options.map_or(ptr::null(), RunOptions::as_ptr),
+                input_names.as_ptr(),
+                input_values.as_ptr(),
+                input_values.len(),
+                output_name_ptrs.as_ptr(),
+                output_name_ptrs.len(),
+                outputs.as_mut_ptr(),
+            )
+        };
+        if let Err(error) = check_status(api, status) {
+            release_values(api, outputs);
+            return Err(error.into());
+        }
+        if outputs.iter().any(|value| value.is_null()) {
+            release_values(api, outputs);
+            return Err(ffi::Error::NullPointer {
+                what: "output value",
+            }
+            .into());
+        }
+        outputs
+            .into_iter()
+            .map(|value| {
+                let value = NonNull::new(value).expect("output null pointers were rejected");
+                // SAFETY: successful Run transfers each output to the caller.
+                Ok(unsafe { Value::from_raw_owned(self.environment.clone(), value) })
+            })
+            .collect()
+    }
+
+    fn run_into_impl(
+        &self,
+        inputs: &[Input<'_>],
+        outputs: &mut [Output<'_>],
+        options: Option<&RunOptions>,
+    ) -> Result<()> {
+        for environment in inputs
+            .iter()
+            .map(|input| input.environment)
+            .chain(outputs.iter().map(|output| output.environment))
+        {
+            ensure!(
+                Environment::same_runtime(&self.environment, environment),
+                ForeignEnvironmentSnafu
+            );
+        }
+        let input_names = inputs
+            .iter()
+            .map(|input| input.name.as_ptr())
+            .collect::<Vec<_>>();
+        let input_values = inputs.iter().map(Input::value_ptr).collect::<Vec<_>>();
+        let output_names = outputs
+            .iter()
+            .map(|output| output.name.as_ptr())
+            .collect::<Vec<_>>();
+        let original_outputs = outputs.iter().map(Output::value_ptr).collect::<Vec<_>>();
+        let mut returned_outputs = original_outputs.clone();
+        let api = &self.environment.inner.api;
+        // SAFETY: all arrays have matching lengths and every borrowed value is
+        // retained exclusively where ORT may write to it.
+        let status = unsafe {
+            api_function!(api, Run)(
+                self.session as *mut sys::OrtSession,
+                options.map_or(ptr::null(), RunOptions::as_ptr),
+                input_names.as_ptr(),
+                input_values.as_ptr(),
+                input_values.len(),
+                output_names.as_ptr(),
+                output_names.len(),
+                returned_outputs.as_mut_ptr(),
+            )
+        };
+        let mut replaced = None;
+        for ((returned, original), output) in returned_outputs
+            .into_iter()
+            .zip(original_outputs)
+            .zip(outputs.iter())
+        {
+            if returned != original {
+                if !returned.is_null() {
+                    // SAFETY: a replacement value is newly owned by this call.
+                    unsafe { api_function!(api, ReleaseValue)(returned) };
+                }
+                replaced.get_or_insert_with(|| output.name.to_string_lossy().into_owned());
+            }
+        }
+        check_status(api, status)?;
+        if let Some(name) = replaced {
+            return Err(Error::ReplacedOutput { name });
+        }
+        Ok(())
+    }
+}
+
+/// Future returned by [`Session::run_async`].
+#[must_use = "futures do nothing unless awaited or polled"]
+pub struct RunFuture<'a> {
+    session: &'a Session,
+    environment: Environment,
+    completion: Arc<AsyncCompletion>,
+    run_options: RunOptions,
+    _input_names: Vec<CString>,
+    input_name_ptrs: Vec<*const std::ffi::c_char>,
+    input_value_ptrs: Vec<*const sys::OrtValue>,
+    _output_names: Vec<CString>,
+    output_name_ptrs: Vec<*const std::ffi::c_char>,
+    output_slots: Vec<*mut sys::OrtValue>,
+    _input_borrow: PhantomData<&'a [Input<'a>]>,
+    finished: bool,
+}
+
+impl Future for RunFuture<'_> {
+    type Output = Result<Vec<Value<'static>>>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(!self.finished, "RunFuture polled after completion");
+        let Some(result) = self.completion.poll_result(context.waker()) else {
+            return Poll::Pending;
+        };
+        self.finished = true;
+        Poll::Ready(match result {
+            Ok(values) => Ok(values
+                .into_iter()
+                .map(|value| {
+                    let value = NonNull::new(value as *mut sys::OrtValue)
+                        .expect("async completion rejected null outputs");
+                    // SAFETY: callback completion transfers unique ownership.
+                    unsafe { Value::from_raw_owned(self.environment.clone(), value) }
+                })
+                .collect()),
+            Err(source) => Err(Error::Async { source }),
+        })
+    }
+}
+
+impl RunFuture<'_> {
+    /// Requests cooperative cancellation of the native run.
+    pub fn cancel(&self) -> Result<()> {
+        self.run_options.terminate()?;
+        Ok(())
+    }
+}
+
+impl Drop for RunFuture<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = self.run_options.terminate();
+        if let Ok(values) = self.completion.wait_result() {
+            for value in values {
+                // SAFETY: successful callback outputs not consumed by poll are
+                // uniquely owned by this future.
+                unsafe {
+                    api_function!(self.session.environment.inner.api, ReleaseValue)(
+                        value as *mut sys::OrtValue,
+                    )
+                };
+            }
+        }
+        self.finished = true;
+    }
+}
+
+impl Environment {
+    /// Returns the loaded ONNX Runtime C API table.
+    pub fn raw_api(&self) -> &sys::Api {
+        &self.inner.api
+    }
+}
+
+fn release_values(api: &sys::Api, values: Vec<*mut sys::OrtValue>) {
+    for value in values.into_iter().filter(|value| !value.is_null()) {
+        // SAFETY: each non-null output is uniquely owned by the failed run.
+        unsafe { api_function!(api, ReleaseValue)(value) };
+    }
+}
+
+fn tensor_info_from_shape(
+    api: &sys::Api,
+    info: *const sys::OrtTensorTypeAndShapeInfo,
+) -> Result<TensorInfo> {
+    let mut element_type = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    // SAFETY: shape info is live and output storage is writable.
+    status_call!(api, GetTensorElementType(info, &mut element_type))?;
+    let mut rank = 0;
+    // SAFETY: shape info is live and output storage is writable.
+    status_call!(api, GetDimensionsCount(info, &mut rank))?;
+    let mut shape = vec![0_i64; rank];
+    // SAFETY: shape has exactly rank writable entries.
+    status_call!(api, GetDimensions(info, shape.as_mut_ptr(), shape.len()))?;
+    Ok(TensorInfo {
+        element_type: element_type.into(),
+        shape,
+    })
+}
+
+fn memory_info_name(api: &sys::Api, memory_info: *const sys::OrtMemoryInfo) -> Result<String> {
+    let mut name = ptr::null();
+    // SAFETY: memory_info is live and output storage is writable. The returned
+    // string is owned by memory_info and callers tie the borrow accordingly.
+    status_call!(api, MemoryInfoGetName(memory_info, &mut name))?;
+    let name = require_non_null(name.cast_mut(), "memory info name")?;
+    // SAFETY: ONNX Runtime documents this as a NUL-terminated string valid for
+    // the lifetime of memory_info. Copy it before returning.
+    Ok(unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn memory_info_allocator_type(
     api: &sys::Api,
     memory_info: *const sys::OrtMemoryInfo,
-    tensor: &impl TensorView,
-) -> Result<*mut sys::OrtValue> {
-    let tensor = tensor.as_raw_tensor();
-    let mut value = ptr::null_mut();
-    // SAFETY: the descriptor was validated as compact and its byte-offset
-    // adjusted address is used only as an opaque pointer for its declared
-    // device. Rust never dereferences a CUDA pointer.
-    let data =
-        unsafe { tensor.offset_bytes_ptr() }.map_err(|source| Error::DlpackTensor { source })?;
-    let shape = tensor.shape();
-    // SAFETY: memory_info and shape are live, data describes tensor.num_bytes()
-    // external bytes, and ORT does not take ownership of the allocation.
-    status_call!(
-        api,
-        CreateTensorWithDataAsOrtValue(
-            memory_info,
-            data.cast_mut().cast(),
-            tensor.num_bytes(),
-            shape.as_ptr(),
-            shape.len(),
-            dlpack_to_onnx(tensor.dtype())?,
-            &mut value,
-        )
-    )?;
-    Ok(require_non_null(value, "I/O Binding tensor value")?)
+) -> Result<AllocatorType> {
+    let mut allocator_type = sys::OrtAllocatorType::OrtInvalidAllocator;
+    // SAFETY: memory_info is live and output storage is writable.
+    status_call!(api, MemoryInfoGetType(memory_info, &mut allocator_type))?;
+    match allocator_type {
+        sys::OrtAllocatorType::OrtDeviceAllocator => Ok(AllocatorType::Device),
+        sys::OrtAllocatorType::OrtArenaAllocator => Ok(AllocatorType::Arena),
+        value => Err(Error::UnknownAllocatorType { value: value.0 }),
+    }
 }
 
-pub(super) fn validate_dlpack_flags(flags: DlpackFlags, dtype: DLDataType) -> Result<()> {
-    ensure!(
-        !flags.contains(DlpackFlags::IS_SUBBYTE_TYPE_PADDED),
-        UnsupportedDlpackFlagsSnafu { flags, dtype }
-    );
-    Ok(())
+fn memory_info_device_id(api: &sys::Api, memory_info: *const sys::OrtMemoryInfo) -> Result<i32> {
+    let mut device_id = 0;
+    // SAFETY: memory_info is live and output storage is writable.
+    status_call!(api, MemoryInfoGetId(memory_info, &mut device_id))?;
+    Ok(device_id)
 }
 
-pub(super) fn string_element_count(shape: &[i64]) -> Result<usize> {
+fn memory_info_memory_type(
+    api: &sys::Api,
+    memory_info: *const sys::OrtMemoryInfo,
+) -> Result<MemoryType> {
+    let mut memory_type = sys::OrtMemType::OrtMemTypeDefault;
+    // SAFETY: memory_info is live and output storage is writable.
+    status_call!(api, MemoryInfoGetMemType(memory_info, &mut memory_type))?;
+    match memory_type {
+        sys::OrtMemType::OrtMemTypeCPUInput => Ok(MemoryType::CpuInput),
+        sys::OrtMemType::OrtMemTypeCPUOutput => Ok(MemoryType::CpuOutput),
+        sys::OrtMemType::OrtMemTypeDefault => Ok(MemoryType::Default),
+        value => Err(Error::UnknownMemoryType { value: value.0 }),
+    }
+}
+
+fn memory_info_device_type(api: &sys::Api, memory_info: *const sys::OrtMemoryInfo) -> DeviceType {
+    let mut device_type = sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU;
+    // SAFETY: memory_info is live and output storage is writable.
+    unsafe { api_function!(api, MemoryInfoGetDeviceType)(memory_info, &mut device_type) };
+    match device_type {
+        sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU => DeviceType::Cpu,
+        sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_GPU => DeviceType::Gpu,
+        sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA => DeviceType::Fpga,
+        value => DeviceType::Unknown(value.0),
+    }
+}
+
+fn memory_info_details(
+    api: &sys::Api,
+    memory_info: *const sys::OrtMemoryInfo,
+) -> Result<MemoryInfoDetails> {
+    Ok(MemoryInfoDetails {
+        name: memory_info_name(api, memory_info)?,
+        allocator_type: memory_info_allocator_type(api, memory_info)?,
+        device_id: memory_info_device_id(api, memory_info)?,
+        memory_type: memory_info_memory_type(api, memory_info)?,
+        device_type: memory_info_device_type(api, memory_info),
+    })
+}
+
+fn element_count(shape: &[i64]) -> Result<usize> {
     shape
         .iter()
         .copied()
         .enumerate()
         .try_fold(1_usize, |count, (axis, value)| {
-            let dimension = usize::try_from(value)
-                .map_err(|_| Error::InvalidStringDimension { axis, value })?;
+            let dimension =
+                usize::try_from(value).map_err(|_| Error::NegativeDimension { axis, value })?;
             count
                 .checked_mul(dimension)
-                .ok_or(Error::StringElementCountOverflow)
+                .ok_or(Error::ElementCountOverflow)
         })
 }
 
-pub(super) fn string_input_values<I, S>(shape: &[i64], values: I) -> Result<Vec<CString>>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let expected = string_element_count(shape)?;
-    let values = values
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            CString::new(value.as_ref())
-                .map_err(|source| Error::InvalidStringElement { index, source })
-        })
-        .collect::<Result<Vec<_>>>()?;
+fn validate_sparse_source(
+    environment: &Environment,
+    allocator: &Allocator<'_>,
+    source_memory: &MemoryInfo,
+    values_shape: &[i64],
+    values_len: usize,
+) -> Result<()> {
     ensure!(
-        values.len() == expected,
-        StringElementCountSnafu {
+        Environment::same_runtime(environment, &allocator.session.environment)
+            && Environment::same_runtime(environment, &source_memory.environment),
+        ForeignEnvironmentSnafu
+    );
+    ensure!(
+        source_memory.device_type() == DeviceType::Cpu,
+        NonCpuMemorySnafu
+    );
+    let expected = element_count(values_shape)?;
+    ensure!(
+        expected == values_len,
+        ElementCountSnafu {
             expected,
-            actual: values.len(),
+            actual: values_len
         }
     );
-    Ok(values)
+    Ok(())
 }
 
-pub(super) fn dlpack_to_onnx(dtype: DLDataType) -> Result<sys::ONNXTensorElementDataType> {
+fn to_native_element_type(element_type: ElementType) -> sys::ONNXTensorElementDataType {
     use sys::ONNXTensorElementDataType as O;
-    ensure!(dtype.lanes == 1, UnsupportedDlpackTypeSnafu { dtype });
-    let value = match (dtype.code, dtype.bits) {
-        (DLDataTypeCode::FLOAT, 16) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
-        (DLDataTypeCode::FLOAT, 32) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-        (DLDataTypeCode::FLOAT, 64) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
-        (DLDataTypeCode::BFLOAT, 16) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16,
-        (DLDataTypeCode::INT, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
-        (DLDataTypeCode::INT, 16) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16,
-        (DLDataTypeCode::INT, 32) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
-        (DLDataTypeCode::INT, 64) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
-        (DLDataTypeCode::UINT, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
-        (DLDataTypeCode::UINT, 16) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16,
-        (DLDataTypeCode::UINT, 32) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
-        (DLDataTypeCode::UINT, 64) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
-        (DLDataTypeCode::BOOL, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL,
-        (DLDataTypeCode::COMPLEX, 64) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64,
-        (DLDataTypeCode::COMPLEX, 128) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128,
-        (DLDataTypeCode::FLOAT8_E4M3FN, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN,
-        (DLDataTypeCode::FLOAT8_E4M3FNUZ, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ,
-        (DLDataTypeCode::FLOAT8_E5M2, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2,
-        (DLDataTypeCode::FLOAT8_E5M2FNUZ, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ,
-        (DLDataTypeCode::UINT, 4) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4,
-        (DLDataTypeCode::INT, 4) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
-        (DLDataTypeCode::FLOAT4_E2M1FN, 4) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
-        (DLDataTypeCode::UINT, 2) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
-        (DLDataTypeCode::INT, 2) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
-        (DLDataTypeCode::FLOAT8_E8M0FNU, 8) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
-        _ => return Err(Error::UnsupportedDlpackType { dtype }),
-    };
-    Ok(value)
-}
-
-pub(super) fn onnx_to_dlpack(element_type: sys::ONNXTensorElementDataType) -> Result<DLDataType> {
-    use sys::ONNXTensorElementDataType as O;
-    let (code, bits) = match element_type {
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 => (DLDataTypeCode::FLOAT, 16),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT => (DLDataTypeCode::FLOAT, 32),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE => (DLDataTypeCode::FLOAT, 64),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 => (DLDataTypeCode::BFLOAT, 16),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 => (DLDataTypeCode::INT, 8),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16 => (DLDataTypeCode::INT, 16),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 => (DLDataTypeCode::INT, 32),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => (DLDataTypeCode::INT, 64),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 => (DLDataTypeCode::UINT, 8),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16 => (DLDataTypeCode::UINT, 16),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32 => (DLDataTypeCode::UINT, 32),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64 => (DLDataTypeCode::UINT, 64),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL => (DLDataTypeCode::BOOL, 8),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64 => (DLDataTypeCode::COMPLEX, 64),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128 => (DLDataTypeCode::COMPLEX, 128),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN => (DLDataTypeCode::FLOAT8_E4M3FN, 8),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ => (DLDataTypeCode::FLOAT8_E4M3FNUZ, 8),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2 => (DLDataTypeCode::FLOAT8_E5M2, 8),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ => (DLDataTypeCode::FLOAT8_E5M2FNUZ, 8),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4 => (DLDataTypeCode::UINT, 4),
-        O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4 => (DLDataTypeCode::INT, 4),
-        sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1 => (DLDataTypeCode::FLOAT4_E2M1FN, 4),
-        sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2 => (DLDataTypeCode::UINT, 2),
-        sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 => (DLDataTypeCode::INT, 2),
-        sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0 => (DLDataTypeCode::FLOAT8_E8M0FNU, 8),
-        _ => return Err(Error::UnsupportedOnnxType { element_type }),
-    };
-    Ok(DLDataType {
-        code,
-        bits,
-        lanes: 1,
-    })
-}
-
-pub(super) fn create_string_tensor(
-    api: &sys::Api,
-    allocator: *mut sys::OrtAllocator,
-    input: &StringInput,
-) -> Result<*mut sys::OrtValue> {
-    create_string_tensor_parts(api, allocator, &input.shape, &input.values)
-}
-
-pub(super) fn create_string_tensor_parts(
-    api: &sys::Api,
-    allocator: *mut sys::OrtAllocator,
-    shape: &[i64],
-    strings: &[CString],
-) -> Result<*mut sys::OrtValue> {
-    let mut value = ptr::null_mut();
-    // SAFETY: allocator and shape are live; value is writable output storage.
-    status_call!(
-        api,
-        CreateTensorAsOrtValue(
-            allocator,
-            shape.as_ptr(),
-            shape.len(),
-            sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING,
-            &mut value,
-        )
-    )?;
-    let value = require_non_null(value, "string input value")?;
-    let mut guard = ValueGuard::new(api, value);
-    let pointers = strings
-        .iter()
-        .map(|value| value.as_ptr())
-        .collect::<Vec<_>>();
-    let pointers_ptr = if pointers.is_empty() {
-        ptr::null()
-    } else {
-        pointers.as_ptr()
-    };
-    // SAFETY: every pointer is NUL-terminated and remains live for the call;
-    // a zero-length tensor uses a null array pointer.
-    status_call!(api, FillStringTensor(value, pointers_ptr, pointers.len()))?;
-    guard.disarm();
-    Ok(value)
-}
-
-pub(super) fn create_input_value(
-    api: &sys::Api,
-    memory_info: *const sys::OrtMemoryInfo,
-    allocator: *mut sys::OrtAllocator,
-    input: &InputValue<'_>,
-) -> Result<*mut sys::OrtValue> {
-    match input {
-        InputValue::Tensor(tensor) => create_external_tensor(api, memory_info, tensor),
-        InputValue::Strings(input) => {
-            create_string_tensor_parts(api, allocator, &input.shape, &input.values)
-        }
-        InputValue::Sequence(values) => create_sequence_input(api, memory_info, allocator, values),
-        InputValue::Map { keys, values } => {
-            create_map_input(api, memory_info, allocator, keys, values)
-        }
+    match element_type {
+        ElementType::Undefined => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED,
+        ElementType::Float32 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        ElementType::Uint8 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+        ElementType::Int8 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
+        ElementType::Uint16 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16,
+        ElementType::Int16 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16,
+        ElementType::Int32 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+        ElementType::Int64 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+        ElementType::String => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING,
+        ElementType::Bool => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL,
+        ElementType::Float16 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+        ElementType::Float64 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
+        ElementType::Uint32 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+        ElementType::Uint64 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
+        ElementType::Complex64 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64,
+        ElementType::Complex128 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128,
+        ElementType::BFloat16 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16,
+        ElementType::Float8E4M3Fn => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN,
+        ElementType::Float8E4M3Fnuz => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ,
+        ElementType::Float8E5M2 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2,
+        ElementType::Float8E5M2Fnuz => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ,
+        ElementType::Uint4 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4,
+        ElementType::Int4 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
+        ElementType::Float4E2M1 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
+        ElementType::Uint2 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
+        ElementType::Int2 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
+        ElementType::Float8E8M0 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
     }
-}
-
-pub(super) fn create_sequence_input(
-    api: &sys::Api,
-    memory_info: *const sys::OrtMemoryInfo,
-    allocator: *mut sys::OrtAllocator,
-    inputs: &[InputValue<'_>],
-) -> Result<*mut sys::OrtValue> {
-    let inputs = inputs.iter().collect::<Vec<_>>();
-    create_container_input(
-        api,
-        memory_info,
-        allocator,
-        &inputs,
-        sys::ONNXType::ONNX_TYPE_SEQUENCE,
-        "sequence input value",
-    )
-}
-
-pub(super) fn create_map_input(
-    api: &sys::Api,
-    memory_info: *const sys::OrtMemoryInfo,
-    allocator: *mut sys::OrtAllocator,
-    keys: &InputValue<'_>,
-    values: &InputValue<'_>,
-) -> Result<*mut sys::OrtValue> {
-    create_container_input(
-        api,
-        memory_info,
-        allocator,
-        &[keys, values],
-        sys::ONNXType::ONNX_TYPE_MAP,
-        "map input value",
-    )
-}
-
-pub(super) fn create_container_input(
-    api: &sys::Api,
-    memory_info: *const sys::OrtMemoryInfo,
-    allocator: *mut sys::OrtAllocator,
-    inputs: &[&InputValue<'_>],
-    value_type: sys::ONNXType,
-    description: &'static str,
-) -> Result<*mut sys::OrtValue> {
-    let mut children = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let value = create_input_value(api, memory_info, allocator, input)?;
-        children.push(ValueGuard::new(api, value));
-    }
-    let pointers = children
-        .iter()
-        .map(|value| value.ptr.cast_const())
-        .collect::<Vec<_>>();
-    let pointers = if pointers.is_empty() {
-        ptr::null()
-    } else {
-        pointers.as_ptr()
-    };
-    let mut value = ptr::null_mut();
-    // SAFETY: child pointers are live for the call. CreateValue retains the
-    // supplied values, so the temporary child guards may be dropped afterward.
-    status_call!(
-        api,
-        CreateValue(pointers, children.len(), value_type, &mut value)
-    )?;
-    Ok(require_non_null(value, description)?)
-}
-
-pub(super) fn output_to_value(
-    environment: Environment,
-    value: *mut sys::OrtValue,
-) -> Result<Value> {
-    let api = &environment.inner.api;
-    let mut value_guard = ValueGuard::new(api, value);
-    let mut is_tensor = 0;
-    // SAFETY: value is a live ORT output and is_tensor is writable.
-    status_call!(api, IsTensor(value.cast_const(), &mut is_tensor))?;
-    if is_tensor == 0 {
-        let mut info = ptr::null_mut();
-        // SAFETY: value is live and info is writable output storage.
-        status_call!(api, GetTypeInfo(value.cast_const(), &mut info))?;
-        let info = require_non_null(info, "output type info")?;
-        let _guard = TypeInfoGuard {
-            api,
-            type_info: info,
-        };
-        let mut value_type = sys::ONNXType::ONNX_TYPE_UNKNOWN;
-        // SAFETY: info is live and value_type is writable.
-        status_call!(api, GetOnnxTypeFromTypeInfo(info, &mut value_type))?;
-        return match value_type {
-            sys::ONNXType::ONNX_TYPE_SEQUENCE
-            | sys::ONNXType::ONNX_TYPE_MAP
-            | sys::ONNXType::ONNX_TYPE_OPTIONAL => {
-                container_output(&environment, value, value_type)
-            }
-            _ => Err(Error::UnsupportedValueType { value_type }),
-        };
-    }
-
-    let mut info = ptr::null_mut();
-    // SAFETY: value is a live tensor and info is writable output storage.
-    status_call!(api, GetTensorTypeAndShape(value, &mut info))?;
-    let info = require_non_null(info, "output tensor shape info")?;
-    let info_guard = ShapeInfoGuard { api, info };
-    let mut element_type = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
-    // SAFETY: info is live and element_type is writable.
-    status_call!(api, GetTensorElementType(info, &mut element_type))?;
-    drop(info_guard);
-
-    if element_type == sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING {
-        value_guard.disarm();
-        return string_output(api, value).map(Value::Strings);
-    }
-    value_guard.disarm();
-    drop(value_guard);
-    output_to_dlpack(environment, value).map(Value::Tensor)
-}
-
-pub(super) fn container_output(
-    environment: &Environment,
-    value: *mut sys::OrtValue,
-    value_type: sys::ONNXType,
-) -> Result<Value> {
-    let api = &environment.inner.api;
-    let allocator = default_allocator(api)?;
-    let mut count = 0;
-    // SAFETY: value is a live container and count is writable output storage.
-    status_call!(api, GetValueCount(value.cast_const(), &mut count))?;
-    let mut children = Vec::with_capacity(count);
-    for index in 0..count {
-        let mut child = ptr::null_mut();
-        // SAFETY: index is within the queried child count and child is writable.
-        status_call!(
-            api,
-            GetValue(value.cast_const(), index as i32, allocator, &mut child)
-        )?;
-        let child = require_non_null(child, "container child value")?;
-        children.push(output_to_value(environment.clone(), child)?);
-    }
-    match value_type {
-        sys::ONNXType::ONNX_TYPE_SEQUENCE => Ok(Value::Sequence(children)),
-        sys::ONNXType::ONNX_TYPE_MAP => {
-            if children.len() != 2 {
-                return Err(Error::ContainerValueCount {
-                    kind: "map",
-                    expected: 2,
-                    actual: children.len(),
-                });
-            }
-            let mut children = children.into_iter();
-            Ok(Value::Map {
-                keys: Box::new(children.next().expect("map child count checked")),
-                values: Box::new(children.next().expect("map child count checked")),
-            })
-        }
-        sys::ONNXType::ONNX_TYPE_OPTIONAL => match children.len() {
-            0 => Ok(Value::Optional(None)),
-            1 => Ok(Value::Optional(Some(Box::new(
-                children.pop().expect("optional child count checked"),
-            )))),
-            actual => Err(Error::ContainerValueCount {
-                kind: "optional",
-                expected: 1,
-                actual,
-            }),
-        },
-        _ => Err(Error::UnsupportedValueType { value_type }),
-    }
-}
-
-pub(super) fn string_output(api: &sys::Api, value: *mut sys::OrtValue) -> Result<StringTensor> {
-    let value_guard = ValueGuard::new(api, value);
-    let mut info = ptr::null_mut();
-    // SAFETY: value is live and info is writable output storage.
-    status_call!(api, GetTensorTypeAndShape(value, &mut info))?;
-    let info = require_non_null(info, "string tensor shape info")?;
-    let info_guard = ShapeInfoGuard { api, info };
-    let mut rank = 0;
-    // SAFETY: info is live and rank is writable.
-    status_call!(api, GetDimensionsCount(info, &mut rank))?;
-    let mut shape = vec![0_i64; rank];
-    // SAFETY: shape contains rank writable entries.
-    status_call!(api, GetDimensions(info, shape.as_mut_ptr(), rank))?;
-    let mut element_count = 0;
-    // SAFETY: info is live and element_count is writable.
-    status_call!(api, GetTensorShapeElementCount(info, &mut element_count))?;
-    drop(info_guard);
-
-    let mut data_len = 0;
-    // SAFETY: value is a live string tensor and data_len is writable.
-    status_call!(
-        api,
-        GetStringTensorDataLength(value.cast_const(), &mut data_len)
-    )?;
-    let mut data = vec![0_u8; data_len];
-    let mut offsets = vec![0_usize; element_count];
-    let data_ptr = if data.is_empty() {
-        ptr::null_mut()
-    } else {
-        data.as_mut_ptr().cast()
-    };
-    let offsets_ptr = if offsets.is_empty() {
-        ptr::null_mut()
-    } else {
-        offsets.as_mut_ptr()
-    };
-    // SAFETY: buffers match the exact sizes queried from the tensor.
-    status_call!(
-        api,
-        GetStringTensorContent(
-            value.cast_const(),
-            data_ptr,
-            data.len(),
-            offsets_ptr,
-            offsets.len(),
-        )
-    )?;
-    let mut values = Vec::with_capacity(element_count);
-    for (index, start) in offsets.iter().copied().enumerate() {
-        let end = offsets.get(index + 1).copied().unwrap_or(data.len());
-        if start > end || end > data.len() {
-            return Err(Error::InvalidStringOffsets {
-                index,
-                start,
-                end,
-                data_len: data.len(),
-            });
-        }
-        let bytes = data[start..end].to_vec();
-        values.push(
-            String::from_utf8(bytes)
-                .map_err(|source| Error::InvalidStringUtf8 { index, source })?,
-        );
-    }
-    drop(value_guard);
-    Ok(StringTensor { shape, values })
-}
-
-pub(super) fn output_to_dlpack(
-    environment: Environment,
-    value: *mut sys::OrtValue,
-) -> Result<versioned::Dlpack> {
-    let api = environment.inner.api.clone();
-    let mut value_guard = ValueGuard::new(&api, value);
-    let mut info = ptr::null_mut();
-    // SAFETY: value is a live ORT output and info is writable output storage.
-    status_call!(&api, GetTensorTypeAndShape(value, &mut info))?;
-    let info = require_non_null(info, "tensor shape info")?;
-    let info_guard = ShapeInfoGuard { api: &api, info };
-
-    let mut element_type = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
-    // SAFETY: info remains live until info_guard is dropped.
-    status_call!(&api, GetTensorElementType(info, &mut element_type))?;
-    let dtype = onnx_to_dlpack(element_type)?;
-    let mut memory_info = ptr::null();
-    // SAFETY: value is live and memory_info is writable borrowed output storage.
-    status_call!(&api, GetTensorMemoryInfo(value, &mut memory_info))?;
-    let memory_info = require_const_non_null(memory_info, "tensor memory info")?;
-    let mut memory_name = ptr::null();
-    let mut device_id = 0;
-    // SAFETY: memory_info is borrowed from the live tensor value.
-    status_call!(&api, MemoryInfoGetName(memory_info, &mut memory_name))?;
-    // SAFETY: memory_info is live and device_id is writable.
-    status_call!(&api, MemoryInfoGetId(memory_info, &mut device_id))?;
-    let memory_name = require_const_non_null(memory_name, "tensor memory name")?;
-    // SAFETY: ORT memory-info names are NUL-terminated for the value lifetime.
-    let memory_name = unsafe { CStr::from_ptr(memory_name) }
-        .to_string_lossy()
-        .into_owned();
-    let device = match memory_name.as_str() {
-        "Cpu" | "CPU" => DLDevice::CPU,
-        "Cuda" | "CUDA" if device_id >= 0 => DLDevice {
-            device_type: DLDeviceType::CUDA,
-            device_id,
-        },
-        "CudaPinned" | "CUDA_PINNED" if device_id >= 0 => DLDevice {
-            device_type: DLDeviceType::CUDAHOST,
-            device_id,
-        },
-        _ => {
-            return Err(Error::UnsupportedOrtMemory {
-                name: memory_name,
-                device_id,
-            });
-        }
-    };
-    let mut rank = 0;
-    // SAFETY: info is valid and rank is writable.
-    status_call!(&api, GetDimensionsCount(info, &mut rank))?;
-    let mut shape = vec![0_i64; rank];
-    // SAFETY: shape has exactly rank writable elements.
-    status_call!(&api, GetDimensions(info, shape.as_mut_ptr(), rank))?;
-    let mut data = ptr::null_mut();
-    // SAFETY: value is a live tensor value and data is writable output storage.
-    status_call!(&api, GetTensorMutableData(value, &mut data))?;
-    let mut element_count = 0;
-    // SAFETY: info remains live and element_count is writable.
-    status_call!(&api, GetTensorShapeElementCount(info, &mut element_count))?;
-    if data.is_null() && element_count != 0 {
-        return Err(Error::NullPointer {
-            what: "tensor data",
-        });
-    }
-    drop(info_guard);
-
-    let owner = Box::new(OutputOwner {
-        environment,
-        value: value as usize,
-    });
-    value_guard.disarm();
-    let mut initialized = Dynamic::compact(shape.as_slice())
-        .initialize(owner)
-        .map_err(|source| Error::DlpackMetadata { source })?;
-    initialized
-        .set_data(data)
-        .set_device(device)
-        .set_dtype(dtype)
-        .set_byte_offset(0);
-    // SAFETY: the OutputOwner retains the OrtValue allocation, metadata is
-    // owned by dlpark, and all scalar fields were populated above.
-    Ok(unsafe { initialized.finish() })
 }
