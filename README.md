@@ -231,3 +231,23 @@ optional values are currently output-only.
 dimensions; sequence, map, and optional descriptions retain their nested ONNX
 types. The existing `inputs`, `outputs`, and `overridable_initializers` helpers
 remain convenient tensor-only views.
+
+## Updating the C bindings
+
+`onyxrt-sys` commits generated bindings so downstream builds do not require
+Clang. The workspace `xtask` uses `usage-rs` for its CLI and pins both the ONNX
+Runtime v1.21.0 header URL and its SHA-256 digest:
+
+```text
+cargo xtask download-header
+cargo xtask bindgen
+```
+
+The download task verifies the upstream response before updating the vendored
+header. Binding generation requires libclang and rustfmt. CI checks the
+committed output without modifying it:
+
+```text
+cargo xtask download-header --check
+cargo xtask bindgen --check
+```

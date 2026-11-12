@@ -318,6 +318,7 @@ impl From<sys::ONNXTensorElementDataType> for ElementType {
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2 => Self::Uint2,
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 => Self::Int2,
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0 => Self::Float8E8M0,
+            _ => Self::Undefined,
         }
     }
 }
@@ -1463,7 +1464,7 @@ impl SessionBuilder {
             let level: sys::OrtLoggingLevel = level.into();
             // SAFETY: the logging level is a valid ORT enum value.
             check_status(api, unsafe {
-                (api.table().SetSessionLogSeverityLevel)(options, level as i32)
+                (api.table().SetSessionLogSeverityLevel)(options, level.0 as i32)
             })?;
         }
         if let Some(verbosity) = self.log_verbosity {
@@ -1766,7 +1767,7 @@ impl RunOptions {
         let api = &self.environment.inner.api;
         // SAFETY: the options are live and the logging enum value is valid.
         check_status(api, unsafe {
-            (api.table().RunOptionsSetRunLogSeverityLevel)(self.as_mut_ptr(), level as i32)
+            (api.table().RunOptionsSetRunLogSeverityLevel)(self.as_mut_ptr(), level.0 as i32)
         })?;
         Ok(self)
     }
@@ -3097,6 +3098,7 @@ fn read_value_type(api: &sys::Api, type_info: *mut sys::OrtTypeInfo) -> Result<V
         sys::ONNXType::ONNX_TYPE_SPARSETENSOR => Ok(ValueTypeInfo::SparseTensor),
         sys::ONNXType::ONNX_TYPE_OPAQUE => Ok(ValueTypeInfo::Opaque),
         sys::ONNXType::ONNX_TYPE_UNKNOWN => Ok(ValueTypeInfo::Unknown),
+        _ => Ok(ValueTypeInfo::Unknown),
     }
 }
 
@@ -3433,7 +3435,7 @@ unsafe impl Send for AsyncCompletion {}
 // SAFETY: all shared mutation is synchronized by the mutex and condition variable.
 unsafe impl Sync for AsyncCompletion {}
 
-unsafe extern "C" fn async_run_callback(
+unsafe extern "system" fn async_run_callback(
     user_data: *mut std::ffi::c_void,
     outputs: *mut *mut sys::OrtValue,
     num_outputs: usize,

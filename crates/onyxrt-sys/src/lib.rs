@@ -24,7 +24,8 @@ use std::{
 use libloading::Library;
 use snafu::Snafu;
 
-pub use ort_sys::*;
+mod bindings;
+pub use bindings::*;
 
 /// Errors produced while loading the ONNX Runtime C API.
 #[derive(Debug, Snafu)]

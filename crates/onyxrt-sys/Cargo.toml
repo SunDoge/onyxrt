@@ -6,15 +6,18 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 libloading = { workspace = true, optional = true }
 snafu.workspace = true
-ort-sys = { version = "2.0.0-rc.15", default-features = false, features = ["std", "api-21"] }
+ort-sys = { version = "2.0.0-rc.15", default-features = false, features = ["std", "api-21"], optional = true }
 
 [features]
 default = ["load-dynamic"]
-load-dynamic = ["dep:libloading", "ort-sys/disable-linking"]
-link-static = []
+load-dynamic = ["dep:libloading"]
+link-static = ["dep:ort-sys"]
 
 [lints]
 workspace = true
