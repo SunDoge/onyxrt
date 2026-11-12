@@ -1,6 +1,7 @@
 [workspace]
 dependencies_update = false
-git_only = true
+git_only = false
+publish = true
 release_always = false
 
 [[package]]
