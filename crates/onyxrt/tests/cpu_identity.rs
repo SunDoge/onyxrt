@@ -129,11 +129,13 @@ fn cpu_dlpack_identity_round_trip() {
     drop(file_session);
     std::fs::remove_file(&model_path).unwrap();
 
-    let session = environment
+    let session_builder = environment
         .session_builder()
-        .cpu_provider(CpuExecutionProvider::new().with_arena(false))
-        .build_from_bytes(IDENTITY_MODEL)
-        .unwrap();
+        .cpu_provider(CpuExecutionProvider::new().with_arena(false));
+    let session = session_builder.build_from_bytes(IDENTITY_MODEL).unwrap();
+    let replacement_session = session_builder.build_from_bytes(IDENTITY_MODEL).unwrap();
+    assert_eq!(replacement_session.inputs().unwrap()[0].name(), "x");
+    drop(replacement_session);
 
     let memory_info = MemoryInfo::cpu(environment.clone()).unwrap();
     assert_eq!(memory_info.name().unwrap().to_str().unwrap(), "Cpu");
@@ -650,7 +652,7 @@ fn dnnl_prebuilt_provider_creates_session() {
     );
     environment
         .session_builder()
-        .dnnl_provider(DnnlExecutionProvider::new())
+        .execution_provider(DnnlExecutionProvider::new())
         .build_from_bytes(IDENTITY_MODEL)
         .unwrap();
 }
@@ -670,7 +672,7 @@ fn cuda_prebuilt_provider_creates_session() {
     );
     let session = environment
         .session_builder()
-        .cuda_provider(CudaExecutionProvider::new().with_device_id(0))
+        .execution_provider(CudaExecutionProvider::new().with_device_id(0))
         .build_from_bytes(IDENTITY_MODEL)
         .unwrap();
     let initialized: dynamic::Initialized<DLManagedTensorVersioned> =
@@ -705,7 +707,7 @@ fn tensorrt_prebuilt_provider_creates_session() {
     );
     environment
         .session_builder()
-        .tensorrt_provider(TensorRtExecutionProvider::new().with_device_id(0))
+        .execution_provider(TensorRtExecutionProvider::new().with_device_id(0))
         .build_from_bytes(IDENTITY_MODEL)
         .unwrap();
 }

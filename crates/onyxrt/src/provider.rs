@@ -425,12 +425,48 @@ impl NamedExecutionProvider {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ExecutionProvider {
+#[non_exhaustive]
+pub enum ExecutionProvider {
+    /// NVIDIA CUDA execution provider.
     Cuda(CudaExecutionProvider),
+    /// NVIDIA TensorRT execution provider.
     TensorRt(TensorRtExecutionProvider),
+    /// Intel OpenVINO execution provider.
     OpenVino(OpenVinoExecutionProvider),
+    /// Intel oneDNN execution provider.
     Dnnl(DnnlExecutionProvider),
+    /// Provider configured through ONNX Runtime's generic provider API.
     Named(NamedExecutionProvider),
+}
+
+impl From<CudaExecutionProvider> for ExecutionProvider {
+    fn from(provider: CudaExecutionProvider) -> Self {
+        Self::Cuda(provider)
+    }
+}
+
+impl From<TensorRtExecutionProvider> for ExecutionProvider {
+    fn from(provider: TensorRtExecutionProvider) -> Self {
+        Self::TensorRt(provider)
+    }
+}
+
+impl From<OpenVinoExecutionProvider> for ExecutionProvider {
+    fn from(provider: OpenVinoExecutionProvider) -> Self {
+        Self::OpenVino(provider)
+    }
+}
+
+impl From<DnnlExecutionProvider> for ExecutionProvider {
+    fn from(provider: DnnlExecutionProvider) -> Self {
+        Self::Dnnl(provider)
+    }
+}
+
+impl From<NamedExecutionProvider> for ExecutionProvider {
+    fn from(provider: NamedExecutionProvider) -> Self {
+        Self::Named(provider)
+    }
 }
 
 pub(super) const fn bool_option(enabled: bool) -> &'static str {

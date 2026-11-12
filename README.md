@@ -40,7 +40,7 @@ use onyxrt::{
 let env = Environment::builder().build()?;
 let session = env
     .session_builder()
-    .cuda_provider(
+    .execution_provider(
         CudaExecutionProvider::new()
             .with_device_id(0)
             .with_arena_extend_strategy(CudaArenaExtendStrategy::NextPowerOfTwo)
@@ -57,6 +57,27 @@ let session = env
 `OpenVinoExecutionProvider` use the corresponding provider-options APIs.
 `NamedExecutionProvider` covers providers exposed through ORT's generic API,
 including QNN, SNPE, XNNPACK, CoreML, and Azure in C API v21.
+
+`SessionBuilder` is a reusable session configuration. Model loading borrows
+the builder, so applications can switch models without rebuilding provider
+configuration:
+
+```rust,no_run
+# use onyxrt::model::Environment;
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let env = Environment::builder().build()?;
+let sessions = env.session_builder().intra_threads(4);
+
+let first = sessions.build_from_file("first.onnx")?;
+let second = sessions.build_from_file("second.onnx")?;
+# let _ = (first, second);
+# Ok(())
+# }
+```
+
+Each load creates a new immutable native session because ONNX Runtime binds a
+session to one model. Applications can replace an `Arc<Session>` when they
+need atomic hot-swapping while in-flight inference keeps using the old model.
 
 For device-resident tensors, `IoBindingInput` and `IoBindingOutput` bind
 preallocated CPU or CUDA DLPack storage directly through `OrtIoBinding`:

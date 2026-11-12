@@ -85,7 +85,11 @@ impl From<ffi::Error> for Error {
     }
 }
 
-/// Builder for an ONNX Runtime inference session.
+/// Reusable configuration for creating ONNX Runtime inference sessions.
+///
+/// Model loading borrows this builder, so one configured instance can create
+/// multiple independent sessions when an application switches models.
+#[derive(Clone)]
 pub struct SessionBuilder {
     pub(super) environment: Environment,
     pub(super) intra_threads: Option<i32>,
@@ -248,41 +252,12 @@ impl SessionBuilder {
         self
     }
 
-    /// Appends CUDA with the next available provider priority.
+    /// Appends an execution provider with the next available priority.
     ///
-    /// Providers are tried in the order their builder methods are called. The
+    /// Providers are tried in the order this method is called. The
     /// built-in CPU provider remains available as the final fallback.
-    pub fn cuda_provider(mut self, provider: CudaExecutionProvider) -> Self {
-        self.execution_providers
-            .push(ExecutionProvider::Cuda(provider));
-        self
-    }
-
-    /// Appends TensorRT with the next available provider priority.
-    pub fn tensorrt_provider(mut self, provider: TensorRtExecutionProvider) -> Self {
-        self.execution_providers
-            .push(ExecutionProvider::TensorRt(provider));
-        self
-    }
-
-    /// Appends the legacy in-tree OpenVINO provider.
-    pub fn openvino_provider(mut self, provider: OpenVinoExecutionProvider) -> Self {
-        self.execution_providers
-            .push(ExecutionProvider::OpenVino(provider));
-        self
-    }
-
-    /// Appends the Intel oneDNN provider.
-    pub fn dnnl_provider(mut self, provider: DnnlExecutionProvider) -> Self {
-        self.execution_providers
-            .push(ExecutionProvider::Dnnl(provider));
-        self
-    }
-
-    /// Appends a provider supported by ONNX Runtime's generic provider API.
-    pub fn named_provider(mut self, provider: NamedExecutionProvider) -> Self {
-        self.execution_providers
-            .push(ExecutionProvider::Named(provider));
+    pub fn execution_provider(mut self, provider: impl Into<ExecutionProvider>) -> Self {
+        self.execution_providers.push(provider.into());
         self
     }
 
@@ -290,13 +265,13 @@ impl SessionBuilder {
     ///
     /// The native path API preserves the model directory, allowing ONNX
     /// Runtime to resolve relative external-data tensor files correctly.
-    pub fn build_from_file(self, path: impl AsRef<Path>) -> Result<Session> {
+    pub fn build_from_file(&self, path: impl AsRef<Path>) -> Result<Session> {
         self.build_from_file_with_external_initializers(path, &[])
     }
 
     /// Builds from a model path while supplying its external initializers.
     pub fn build_from_file_with_external_initializers(
-        self,
+        &self,
         path: impl AsRef<Path>,
         initializers: &[ExternalInitializer<'_>],
     ) -> Result<Session> {
@@ -320,19 +295,19 @@ impl SessionBuilder {
         let session = require_non_null(session, "session")?;
         drop(options);
         Ok(Session {
-            environment: self.environment,
+            environment: self.environment.clone(),
             session: session as usize,
         })
     }
 
     /// Builds a session from an in-memory ONNX model.
-    pub fn build_from_bytes(self, model: &[u8]) -> Result<Session> {
+    pub fn build_from_bytes(&self, model: &[u8]) -> Result<Session> {
         self.build_from_bytes_with_external_initializers(model, &[])
     }
 
     /// Builds from model bytes while supplying its external initializers.
     pub fn build_from_bytes_with_external_initializers(
-        self,
+        &self,
         model: &[u8],
         initializers: &[ExternalInitializer<'_>],
     ) -> Result<Session> {
@@ -354,7 +329,7 @@ impl SessionBuilder {
         let session = require_non_null(session, "session")?;
         drop(options);
         Ok(Session {
-            environment: self.environment,
+            environment: self.environment.clone(),
             session: session as usize,
         })
     }
@@ -475,8 +450,8 @@ impl SessionBuilder {
             let names = self
                 .external_data_files
                 .iter()
-                .map(|(name, _)| cstring(name, "external data file name"))
-                .collect::<ffi::Result<Vec<_>>>()?;
+                .map(|(name, _)| NativeModelPath::new(Path::new(name)))
+                .collect::<provider::Result<Vec<_>>>()?;
             let name_pointers = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
             let buffers = self
                 .external_data_files
