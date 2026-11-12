@@ -1,26 +1,24 @@
-//! Low-level ONNX Runtime C ABI with dynamic-loading and static-link modes.
+//! Low-level ONNX Runtime C ABI with dynamic loading.
 
-#[cfg(all(feature = "load-dynamic", feature = "link-static"))]
-compile_error!("features `load-dynamic` and `link-static` are mutually exclusive");
-#[cfg(not(any(feature = "load-dynamic", feature = "link-static")))]
-compile_error!("enable exactly one of `load-dynamic` or `link-static`");
+// The generated comments preserve upstream Doxygen syntax, which rustdoc can
+// otherwise interpret as links, HTML, or Rust code blocks.
+#![allow(
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    rustdoc::invalid_rust_codeblocks
+)]
 
 use std::{
-    ffi::{CStr, OsStr},
+    collections::HashSet,
+    env,
+    ffi::{CStr, OsStr, OsString},
+    mem::ManuallyDrop,
+    path::{Path, PathBuf},
     ptr::NonNull,
     sync::Arc,
 };
 
-#[cfg(feature = "load-dynamic")]
-use std::{
-    collections::HashSet,
-    env,
-    ffi::OsString,
-    mem::ManuallyDrop,
-    path::{Path, PathBuf},
-};
-
-#[cfg(feature = "load-dynamic")]
 use libloading::Library;
 use snafu::Snafu;
 
@@ -31,7 +29,6 @@ pub use bindings::*;
 #[derive(Debug, Snafu)]
 pub enum Error {
     /// A dynamic library could not be opened.
-    #[cfg(feature = "load-dynamic")]
     #[snafu(display("failed to load ONNX Runtime library `{}`", path.display()))]
     LoadLibrary {
         /// Attempted path or loader name.
@@ -41,7 +38,6 @@ pub enum Error {
     },
 
     /// The library does not export `OrtGetApiBase`.
-    #[cfg(feature = "load-dynamic")]
     #[snafu(display("`{}` does not export OrtGetApiBase", path.display()))]
     MissingEntryPoint {
         /// Loaded library path.
@@ -51,7 +47,6 @@ pub enum Error {
     },
 
     /// No candidate dynamic library could be loaded.
-    #[cfg(feature = "load-dynamic")]
     #[snafu(display(
         "could not load ONNX Runtime after trying {attempted} candidate(s); last error: {source}"
     ))]
@@ -68,12 +63,6 @@ pub enum Error {
         /// Description of the linked or loaded runtime.
         origin: String,
     },
-
-    /// An exact runtime path was requested in a statically linked build.
-    #[snafu(display(
-        "runtime library paths require the `load-dynamic` feature; this build uses `link-static`"
-    ))]
-    DynamicLoadingUnavailable,
 
     /// The runtime does not support the API version used to compile this crate.
     #[snafu(display(
@@ -100,7 +89,6 @@ struct ApiInner {
     // ONNX Runtime owns process-global registries and worker infrastructure.
     // Unloading it during Rust static destruction is not supported reliably,
     // so retain a dynamically loaded module until exit without calling dlclose.
-    #[cfg(feature = "load-dynamic")]
     _library: ManuallyDrop<Library>,
 }
 
@@ -113,7 +101,6 @@ unsafe impl Sync for ApiInner {}
 
 impl Api {
     /// Loads the runtime from an exact dynamic library path.
-    #[cfg(feature = "load-dynamic")]
     pub fn load(path: impl AsRef<OsStr>) -> Result<Self, Error> {
         let path = PathBuf::from(path.as_ref());
         // SAFETY: the library is retained in ApiInner for the full lifetime of
@@ -125,74 +112,46 @@ impl Api {
         Self::from_library(library, path)
     }
 
-    /// Reports that loading by path is unavailable in static-link mode.
-    #[cfg(feature = "link-static")]
-    pub fn load(_path: impl AsRef<OsStr>) -> Result<Self, Error> {
-        Err(Error::DynamicLoadingUnavailable)
-    }
-
     /// Acquires the configured runtime and negotiates C API v21.
     ///
-    /// Dynamic mode checks `ORT_DYLIB_PATH` and platform loader names. Static
-    /// mode calls the linked `OrtGetApiBase` symbol directly.
+    /// Checks `ORT_DYLIB_PATH`, library directories, and platform loader names.
     pub fn load_default() -> Result<Self, Error> {
-        #[cfg(feature = "link-static")]
-        {
-            // SAFETY: link-static guarantees that the ORT entry point is linked
-            // into the final binary with the declaration supplied by ort-sys.
-            let base = unsafe { OrtGetApiBase() };
-            let origin = "the statically linked runtime".to_owned();
-            let (api, version) = negotiate(base, &origin)?;
-            Ok(Self {
-                inner: Arc::new(ApiInner {
-                    api,
-                    version,
-                    origin,
-                }),
-            })
-        }
-
-        #[cfg(feature = "load-dynamic")]
         if let Some(path) = env::var_os("ORT_DYLIB_PATH") {
             return Self::load(path);
         }
 
-        #[cfg(feature = "load-dynamic")]
-        {
-            let mut candidates = Vec::new();
-            for variable in ["ORT_LIB_PATH", "ORT_LIB_LOCATION"] {
-                if let Some(value) = env::var_os(variable) {
-                    let path = PathBuf::from(value);
-                    if path.is_dir() {
-                        candidates.extend(candidates_in_directory(&path));
-                    } else {
-                        return Self::load(path);
-                    }
+        let mut candidates = Vec::new();
+        for variable in ["ORT_LIB_PATH", "ORT_LIB_LOCATION"] {
+            if let Some(value) = env::var_os(variable) {
+                let path = PathBuf::from(value);
+                if path.is_dir() {
+                    candidates.extend(candidates_in_directory(&path));
+                } else {
+                    return Self::load(path);
                 }
             }
-            candidates.extend(default_library_names().into_iter().map(PathBuf::from));
-            for directory in dynamic_search_directories() {
-                candidates.extend(candidates_in_directory(&directory));
-            }
-
-            let mut seen = HashSet::new();
-            candidates.retain(|candidate| seen.insert(candidate.clone()));
-            let mut last_error = None;
-            let attempted = candidates.len();
-            for candidate in candidates {
-                match Self::load(candidate) {
-                    Ok(api) => return Ok(api),
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            Err(Error::NoUsableLibrary {
-                attempted,
-                source: Box::new(last_error.expect("each supported platform has a library name")),
-            })
         }
+        candidates.extend(default_library_names().into_iter().map(PathBuf::from));
+        for directory in dynamic_search_directories() {
+            candidates.extend(candidates_in_directory(&directory));
+        }
+
+        let mut seen = HashSet::new();
+        candidates.retain(|candidate| seen.insert(candidate.clone()));
+        let mut last_error = None;
+        let attempted = candidates.len();
+        for candidate in candidates {
+            match Self::load(candidate) {
+                Ok(api) => return Ok(api),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(Error::NoUsableLibrary {
+            attempted,
+            source: Box::new(last_error.expect("each supported platform has a library name")),
+        })
     }
 
-    #[cfg(feature = "load-dynamic")]
     fn from_library(library: Library, path: PathBuf) -> Result<Self, Error> {
         type GetApiBase = unsafe extern "system" fn() -> *const OrtApiBase;
         // SAFETY: the requested symbol has the signature defined by the ORT C API.
@@ -260,7 +219,6 @@ fn negotiate(base: *const OrtApiBase, origin: &str) -> Result<(NonNull<OrtApi>, 
     Ok((api, version))
 }
 
-#[cfg(feature = "load-dynamic")]
 fn default_library_names() -> Vec<OsString> {
     if cfg!(target_os = "windows") {
         vec![OsString::from("onnxruntime.dll")]
@@ -276,7 +234,6 @@ fn default_library_names() -> Vec<OsString> {
     }
 }
 
-#[cfg(feature = "load-dynamic")]
 fn candidates_in_directory(directory: &Path) -> Vec<PathBuf> {
     let mut candidates = default_library_names()
         .into_iter()
@@ -306,7 +263,6 @@ fn candidates_in_directory(directory: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-#[cfg(feature = "load-dynamic")]
 fn dynamic_search_directories() -> Vec<PathBuf> {
     let mut directories = Vec::new();
     for variable in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {

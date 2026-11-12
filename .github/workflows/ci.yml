@@ -28,7 +28,6 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
       - run: cargo test --workspace
-      - run: cargo check --workspace --no-default-features --features link-static
 
   cpu-e2e:
     runs-on: ubuntu-latest

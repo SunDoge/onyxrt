@@ -1,0 +1,188 @@
+use super::*;
+
+pub(super) struct OutputOwner {
+    pub(super) environment: Environment,
+    pub(super) value: usize,
+}
+
+impl Drop for OutputOwner {
+    fn drop(&mut self) {
+        // SAFETY: this owner received the unique live OrtValue and drops it once.
+        unsafe {
+            (self.environment.inner.api.table().ReleaseValue)(self.value as *mut sys::OrtValue)
+        };
+    }
+}
+
+pub(super) struct ValueGuard<'a> {
+    pub(super) api: &'a sys::Api,
+    pub(super) ptr: *mut sys::OrtValue,
+}
+
+impl<'a> ValueGuard<'a> {
+    pub(super) fn new(api: &'a sys::Api, ptr: *mut sys::OrtValue) -> Self {
+        Self { api, ptr }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.ptr = ptr::null_mut();
+    }
+}
+
+impl Drop for ValueGuard<'_> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: a non-null guard pointer is uniquely owned and live.
+            unsafe { (self.api.table().ReleaseValue)(self.ptr) };
+        }
+    }
+}
+
+pub(super) struct MemoryInfoGuard<'a> {
+    pub(super) api: &'a sys::Api,
+    pub(super) memory_info: *mut sys::OrtMemoryInfo,
+}
+
+pub(super) struct IoBindingGuard<'a> {
+    pub(super) api: &'a sys::Api,
+    pub(super) binding: *mut sys::OrtIoBinding,
+}
+
+pub(super) struct AllocatedBufferGuard<'a> {
+    pub(super) api: &'a sys::Api,
+    pub(super) allocator: *mut sys::OrtAllocator,
+    pub(super) allocation: *mut std::ffi::c_void,
+}
+
+impl Drop for AllocatedBufferGuard<'_> {
+    fn drop(&mut self) {
+        if self.allocation.is_null() {
+            return;
+        }
+        // SAFETY: allocation was returned by this exact allocator and is freed once.
+        let status = unsafe { (self.api.table().AllocatorFree)(self.allocator, self.allocation) };
+        if !status.0.is_null() {
+            // SAFETY: Drop cannot report the error, but owns the status.
+            unsafe { (self.api.table().ReleaseStatus)(status.0) };
+        }
+    }
+}
+
+impl Drop for IoBindingGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns the binding pointer.
+        unsafe { (self.api.table().ReleaseIoBinding)(self.binding) };
+    }
+}
+
+impl Drop for MemoryInfoGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns a live memory-info object.
+        unsafe { (self.api.table().ReleaseMemoryInfo)(self.memory_info) };
+    }
+}
+
+pub(super) struct ShapeInfoGuard<'a> {
+    pub(super) api: &'a sys::Api,
+    pub(super) info: *mut sys::OrtTensorTypeAndShapeInfo,
+}
+
+pub(super) struct TypeInfoGuard<'a> {
+    pub(super) api: &'a sys::Api,
+    pub(super) type_info: *mut sys::OrtTypeInfo,
+}
+
+pub(super) struct AvailableProvidersGuard<'a> {
+    pub(super) api: &'a sys::Api,
+    pub(super) providers: *mut *mut std::ffi::c_char,
+    pub(super) count: i32,
+}
+
+impl Drop for AvailableProvidersGuard<'_> {
+    fn drop(&mut self) {
+        if !self.providers.is_null() {
+            discard_provider_array(self.api, self.providers, self.count);
+        }
+    }
+}
+
+pub(super) fn discard_provider_array(
+    api: &sys::Api,
+    providers: *mut *mut std::ffi::c_char,
+    count: i32,
+) {
+    // SAFETY: providers and count are the unmodified outputs from
+    // GetAvailableProviders and this function is called exactly once.
+    let status = unsafe { (api.table().ReleaseAvailableProviders)(providers, count) };
+    if !status.0.is_null() {
+        // ReleaseAvailableProviders is documented never to fail. Still release
+        // a defensive unexpected status to avoid leaking it during Drop.
+        // SAFETY: a non-null status is owned by the caller.
+        unsafe { (api.table().ReleaseStatus)(status.0) };
+    }
+}
+
+impl Drop for TypeInfoGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns a live type-info object.
+        unsafe { (self.api.table().ReleaseTypeInfo)(self.type_info) };
+    }
+}
+
+impl Drop for ShapeInfoGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns a live shape-info object.
+        unsafe { (self.api.table().ReleaseTensorTypeAndShapeInfo)(self.info) };
+    }
+}
+
+pub(super) fn cstring(value: &str, kind: &'static str) -> Result<CString> {
+    CString::new(value).map_err(|source| Error::InvalidName { kind, source })
+}
+
+pub(super) fn require_non_null<T>(pointer: *mut T, what: &'static str) -> Result<*mut T> {
+    if pointer.is_null() {
+        Err(Error::NullPointer { what })
+    } else {
+        Ok(pointer)
+    }
+}
+
+pub(super) fn require_const_non_null<T>(pointer: *const T, what: &'static str) -> Result<*const T> {
+    if pointer.is_null() {
+        Err(Error::NullPointer { what })
+    } else {
+        Ok(pointer)
+    }
+}
+
+pub(super) fn default_allocator(api: &sys::Api) -> Result<*mut sys::OrtAllocator> {
+    let mut allocator = ptr::null_mut();
+    // SAFETY: allocator is writable output storage; the returned default
+    // allocator has process lifetime and is not released by callers.
+    check_status(api, unsafe {
+        (api.table().GetAllocatorWithDefaultOptions)(&mut allocator)
+    })?;
+    require_non_null(allocator, "default allocator")
+}
+
+pub(super) fn check_status(api: &sys::Api, status: sys::OrtStatusPtr) -> Result<()> {
+    if status.0.is_null() {
+        return Ok(());
+    }
+    // SAFETY: non-null status is owned by the caller until ReleaseStatus.
+    let code = unsafe { (api.table().GetErrorCode)(status.0) };
+    // SAFETY: the status remains live and owns its diagnostic message.
+    let message_ptr = unsafe { (api.table().GetErrorMessage)(status.0) };
+    let message = if message_ptr.is_null() {
+        "unknown native error".to_owned()
+    } else {
+        // SAFETY: ORT guarantees a NUL-terminated message for a live status.
+        unsafe { CStr::from_ptr(message_ptr) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    // SAFETY: all status fields have been copied and this releases it exactly once.
+    unsafe { (api.table().ReleaseStatus)(status.0) };
+    Err(Error::Runtime { code, message })
+}

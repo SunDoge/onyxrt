@@ -69,23 +69,14 @@ const MAP_PASSTHROUGH_MODEL: &[u8] = &[
 #[test]
 #[ignore = "requires an ONNX Runtime native library; see README"]
 fn cpu_dlpack_identity_round_trip() {
-    #[cfg(feature = "load-dynamic")]
     let library = std::env::var_os("ONYXRT_TEST_DYLIB");
-    #[cfg(feature = "load-dynamic")]
     if library.is_none() && std::env::var_os("ONYXRT_TEST_DEFAULT_DISCOVERY").is_none() {
         eprintln!(
             "skipping runtime integration test: set ONYXRT_TEST_DYLIB or ONYXRT_TEST_DEFAULT_DISCOVERY"
         );
         return;
     }
-    #[cfg(feature = "link-static")]
-    if std::env::var_os("ONYXRT_TEST_LINKED").is_none() {
-        eprintln!("skipping linked-runtime integration test: ONYXRT_TEST_LINKED is not set");
-        return;
-    }
-
     let environment_builder = Environment::builder().name("onyxrt-integration-test");
-    #[cfg(feature = "load-dynamic")]
     let environment_builder = match library {
         Some(library) => environment_builder.library_path(library),
         None => environment_builder,
@@ -504,7 +495,6 @@ fn tensorrt_prebuilt_provider_creates_session() {
 
 fn provider_test_environment() -> Environment {
     let builder = Environment::builder().name("onyxrt-provider-test");
-    #[cfg(feature = "load-dynamic")]
     let builder = match std::env::var_os("ONYXRT_TEST_DYLIB") {
         Some(library) => builder.library_path(library),
         None => builder,

@@ -7,6 +7,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.92"
+authors = ["SunDoge"]
+homepage = "https://github.com/SunDoge/onyxrt"
+repository = "https://github.com/SunDoge/onyxrt"
+readme = "README.md"
 
 [workspace.dependencies]
 dlpark = "0.11.0"

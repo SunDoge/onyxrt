@@ -6,14 +6,14 @@ interoperability through [`dlpark`](https://crates.io/crates/dlpark).
 The workspace targets ONNX Runtime C API v21 (ONNX Runtime 1.21 or newer) and
 supports CPU, CUDA, TensorRT, oneDNN, legacy OpenVINO, and named providers:
 
-- `onyxrt-sys`: ABI definitions plus dynamic-loading/static-link selection.
+- `onyxrt-sys`: generated ABI definitions and dynamic-library discovery/loading.
 - `onyxrt`: safe environment/session APIs, execution-provider configuration,
   and zero-copy CPU DLPack exchange.
 
-## Linking modes
+## Runtime loading
 
-The default `load-dynamic` feature loads ONNX Runtime through `libloading`.
-Discovery checks `ORT_DYLIB_PATH` first, then `ORT_LIB_PATH`/
+ONNX Runtime is loaded dynamically through `libloading`. Discovery checks
+`ORT_DYLIB_PATH` first, then `ORT_LIB_PATH`/
 `ORT_LIB_LOCATION`, platform loader names, versioned libraries in loader paths,
 and standard system library directories. `Environment::runtime_origin()`
 reports the selected library. Set `ORT_DYLIB_PATH` to force an exact path.
@@ -21,16 +21,6 @@ reports the selected library. Set `ORT_DYLIB_PATH` to force an exact path.
 ```toml
 onyxrt = "0.1"
 ```
-
-For static linking, disable defaults and enable `link-static`. Set
-`ORT_LIB_LOCATION` (or `ORT_LIB_PATH`) to the directory containing the ONNX
-Runtime static archives. Do not set `ORT_PREFER_DYNAMIC_LINK` in this mode.
-
-```toml
-onyxrt = { version = "0.1", default-features = false, features = ["link-static"] }
-```
-
-`load-dynamic` and `link-static` are intentionally mutually exclusive.
 
 ## Execution providers
 

@@ -5,16 +5,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/onyxrt"
+keywords = ["onnx", "onnxruntime", "inference", "dlpack", "machine-learning"]
+categories = ["api-bindings", "science"]
+include = ["src/**", "tests/**", "../../README.md", "../../LICENSE-*"]
 
 [dependencies]
 dlpark.workspace = true
 snafu.workspace = true
-onyxrt-sys = { path = "../onyxrt-sys", version = "0.1.0", default-features = false }
-
-[features]
-default = ["load-dynamic"]
-load-dynamic = ["onyxrt-sys/load-dynamic"]
-link-static = ["onyxrt-sys/link-static"]
+onyxrt-sys = { path = "../onyxrt-sys", version = "0.1.0" }
 
 [dev-dependencies]
 dlpark = { workspace = true, features = ["ndarray"] }
