@@ -1,0 +1,24 @@
+[package]
+name = "onyxrt"
+description = "Safe ONNX Runtime bindings with SNAFU errors and DLPack interoperability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dlpark.workspace = true
+snafu.workspace = true
+onyxrt-sys = { path = "../onyxrt-sys", version = "0.1.0", default-features = false }
+
+[features]
+default = ["load-dynamic"]
+load-dynamic = ["onyxrt-sys/load-dynamic"]
+link-static = ["onyxrt-sys/link-static"]
+
+[dev-dependencies]
+dlpark = { workspace = true, features = ["ndarray"] }
+ndarray = "0.17"
+
+[lints]
+workspace = true
