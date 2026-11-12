@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/SunDoge/onyxrt/compare/onyxrt-v0.1.1...onyxrt-v0.2.0) - 2026-11-12
+
+### Added
+
+- expand tensor memory support
+- [**breaking**] split value ownership and add DLPack export
+
 ### Added
 
 - add accessors for runtime tensor element types and shapes
