@@ -10,7 +10,10 @@ use onyxrt::{
         CpuExecutionProvider, CudaExecutionProvider, DnnlExecutionProvider, LogLevel,
         TensorRtExecutionProvider,
     },
-    raw::{Input as RawInput, MemoryInfo, Output as RawOutput, Value as RawValue},
+    raw::{
+        AllocatorType, DeviceType, Input as RawInput, MemoryInfo, MemoryType, Output as RawOutput,
+        Value as RawValue,
+    },
     value::{
         Input, InputValue, IoBindingDeviceOutput, IoBindingInput, IoBindingOutput, MapInput,
         OutputBuffer, SequenceInput, StringInput, Value, ValueInput,
@@ -114,6 +117,20 @@ fn cpu_dlpack_identity_round_trip() {
         .unwrap();
 
     let memory_info = MemoryInfo::cpu(environment.clone()).unwrap();
+    assert_eq!(memory_info.name().unwrap().to_str().unwrap(), "Cpu");
+    assert_eq!(memory_info.allocator_type().unwrap(), AllocatorType::Arena);
+    assert_eq!(memory_info.device_id().unwrap(), 0);
+    assert_eq!(memory_info.memory_type().unwrap(), MemoryType::Default);
+    assert_eq!(memory_info.device_type(), DeviceType::Cpu);
+    let equivalent_memory_info = MemoryInfo::new(
+        environment.clone(),
+        "Cpu",
+        AllocatorType::Arena,
+        0,
+        MemoryType::Default,
+    )
+    .unwrap();
+    assert!(memory_info.is_equal(&equivalent_memory_info).unwrap());
     let mut raw_data = [1.5_f32, -2.0, 7.25];
     let raw_value =
         RawValue::tensor(environment.clone(), &memory_info, &mut raw_data, [3]).unwrap();
@@ -126,6 +143,12 @@ fn cpu_dlpack_identity_round_trip() {
     raw_outputs[0].as_slice_mut::<f32>().unwrap()[0] = 9.0;
     assert_eq!(raw_outputs[0].as_slice::<f32>().unwrap()[0], 9.0);
 
+    let raw_async_outputs = block_on(session.run_raw_async(&raw_inputs, &["y"]).unwrap()).unwrap();
+    assert_eq!(
+        raw_async_outputs[0].as_slice::<f32>().unwrap(),
+        &[1.5, -2.0, 7.25]
+    );
+
     let mut raw_output_data = [0.0_f32; 3];
     let mut raw_output_value =
         RawValue::tensor(environment.clone(), &memory_info, &mut raw_output_data, [3]).unwrap();
@@ -135,6 +158,42 @@ fn cpu_dlpack_identity_round_trip() {
     }
     assert_eq!(
         raw_output_value.as_slice::<f32>().unwrap(),
+        &[1.5, -2.0, 7.25]
+    );
+
+    let mut allocated_output = RawValue::allocate_tensor::<f32>(environment.clone(), [3]).unwrap();
+    {
+        let mut outputs = [RawOutput::new("y", &mut allocated_output).unwrap()];
+        session.run_raw_into(&raw_inputs, &mut outputs).unwrap();
+    }
+    assert_eq!(
+        allocated_output.as_slice::<f32>().unwrap(),
+        &[1.5, -2.0, 7.25]
+    );
+    let allocated_memory = allocated_output.memory_info().unwrap();
+    assert_eq!(allocated_memory.device_type, DeviceType::Cpu);
+
+    let device_memory_info = MemoryInfo::new(
+        environment.clone(),
+        "Cpu",
+        AllocatorType::Device,
+        0,
+        MemoryType::Default,
+    )
+    .unwrap();
+    let allocator = session.allocator(&device_memory_info).unwrap();
+    assert_eq!(
+        allocator.memory_info().unwrap().allocator_type,
+        AllocatorType::Device
+    );
+    let mut session_allocated_output =
+        RawValue::allocate_tensor_in::<f32>(environment.clone(), &allocator, [3]).unwrap();
+    {
+        let mut outputs = [RawOutput::new("y", &mut session_allocated_output).unwrap()];
+        session.run_raw_into(&raw_inputs, &mut outputs).unwrap();
+    }
+    assert_eq!(
+        session_allocated_output.as_slice::<f32>().unwrap(),
         &[1.5, -2.0, 7.25]
     );
 

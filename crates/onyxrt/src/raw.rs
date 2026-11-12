@@ -5,11 +5,15 @@
 //! which higher-level tensor adapters can be built.
 
 use std::{
-    ffi::{CString, c_void},
+    ffi::{CStr, CString, c_void},
+    future::Future,
     marker::PhantomData,
     mem::{align_of, size_of_val},
+    pin::Pin,
     ptr::{self, NonNull},
     slice,
+    sync::Arc,
+    task::{Context, Poll},
 };
 
 use onyxrt_sys as sys;
@@ -19,6 +23,7 @@ use crate::{
     ffi::{
         self, ShapeInfoGuard, api_function, check_status, cstring, require_non_null, status_call,
     },
+    io_binding::{AsyncCompletion, async_run_callback},
     model::{ElementType, Environment},
     session::{RunOptions, Session},
 };
@@ -34,6 +39,12 @@ pub enum Error {
     Ffi {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(transparent)]
+    Session { source: crate::session::Error },
+
+    #[snafu(transparent)]
+    Async { source: crate::io_binding::Error },
 
     #[snafu(display("object belongs to a different ONNX Runtime environment"))]
     ForeignEnvironment,
@@ -62,6 +73,12 @@ pub enum Error {
     #[snafu(display("tensor data pointer is not aligned for the requested Rust type"))]
     MisalignedData,
 
+    #[snafu(display("ONNX Runtime returned unknown allocator type {value}"))]
+    UnknownAllocatorType { value: i32 },
+
+    #[snafu(display("ONNX Runtime returned unknown memory type {value}"))]
+    UnknownMemoryType { value: i32 },
+
     #[snafu(display("ONNX Runtime replaced preallocated raw output `{name}`"))]
     ReplacedOutput { name: String },
 }
@@ -78,7 +95,6 @@ impl From<ffi::Error> for Error {
 pub struct MemoryInfo {
     environment: Environment,
     memory_info: NonNull<sys::OrtMemoryInfo>,
-    cpu_accessible: bool,
 }
 
 // SAFETY: OrtMemoryInfo is immutable after construction and contains no Rust
@@ -88,6 +104,36 @@ unsafe impl Send for MemoryInfo {}
 unsafe impl Sync for MemoryInfo {}
 
 impl MemoryInfo {
+    /// Creates a memory descriptor for an execution-provider allocator.
+    pub fn new(
+        environment: Environment,
+        name: &str,
+        allocator_type: AllocatorType,
+        device_id: i32,
+        memory_type: MemoryType,
+    ) -> Result<Self> {
+        let name = cstring(name, "memory info name")?;
+        let api = &environment.inner.api;
+        let mut memory_info = ptr::null_mut();
+        // SAFETY: the name and output storage remain live for the call and all
+        // enum values have valid ONNX Runtime representations.
+        status_call!(
+            api,
+            CreateMemoryInfo(
+                name.as_ptr(),
+                allocator_type.into(),
+                device_id,
+                memory_type.into(),
+                &mut memory_info,
+            )
+        )?;
+        Ok(Self {
+            environment,
+            memory_info: NonNull::new(require_non_null(memory_info, "memory info")?)
+                .expect("require_non_null returned a non-null pointer"),
+        })
+    }
+
     /// Creates the standard CPU arena memory descriptor.
     pub fn cpu(environment: Environment) -> Result<Self> {
         let api = &environment.inner.api;
@@ -105,36 +151,76 @@ impl MemoryInfo {
             environment,
             memory_info: NonNull::new(require_non_null(memory_info, "memory info")?)
                 .expect("require_non_null returned a non-null pointer"),
-            cpu_accessible: true,
         })
     }
 
     /// Creates a CUDA device-memory descriptor.
     pub fn cuda(environment: Environment, device_id: i32) -> Result<Self> {
-        let api = &environment.inner.api;
-        let mut memory_info = ptr::null_mut();
-        // SAFETY: the allocator name is static and output storage is writable.
-        status_call!(
-            api,
-            CreateMemoryInfo(
-                c"Cuda".as_ptr(),
-                sys::OrtAllocatorType::OrtDeviceAllocator,
-                device_id,
-                sys::OrtMemType::OrtMemTypeDefault,
-                &mut memory_info,
-            )
-        )?;
-        Ok(Self {
+        Self::new(
             environment,
-            memory_info: NonNull::new(require_non_null(memory_info, "memory info")?)
-                .expect("require_non_null returned a non-null pointer"),
-            cpu_accessible: false,
-        })
+            "Cuda",
+            AllocatorType::Device,
+            device_id,
+            MemoryType::Default,
+        )
     }
 
     /// Returns the native memory-info pointer.
     pub fn as_ptr(&self) -> *const sys::OrtMemoryInfo {
         self.memory_info.as_ptr()
+    }
+
+    /// Returns the allocator name retained by ONNX Runtime.
+    pub fn name(&self) -> Result<&CStr> {
+        let api = &self.environment.inner.api;
+        let mut name = ptr::null();
+        // SAFETY: the descriptor is live and output storage is writable.
+        status_call!(api, MemoryInfoGetName(self.as_ptr(), &mut name))?;
+        let name = require_non_null(name.cast_mut(), "memory info name")?;
+        // SAFETY: ONNX Runtime documents this string as valid for the lifetime
+        // of the descriptor, which is borrowed by the returned reference.
+        Ok(unsafe { CStr::from_ptr(name) })
+    }
+
+    /// Returns the allocator kind.
+    pub fn allocator_type(&self) -> Result<AllocatorType> {
+        memory_info_allocator_type(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns the execution-provider device identifier.
+    pub fn device_id(&self) -> Result<i32> {
+        memory_info_device_id(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns the execution-provider memory kind.
+    pub fn memory_type(&self) -> Result<MemoryType> {
+        memory_info_memory_type(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns the broad device category.
+    pub fn device_type(&self) -> DeviceType {
+        memory_info_device_type(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns a copied snapshot of all descriptor fields.
+    pub fn details(&self) -> Result<MemoryInfoDetails> {
+        memory_info_details(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Compares two descriptors using ONNX Runtime's native semantics.
+    pub fn is_equal(&self, other: &Self) -> Result<bool> {
+        ensure!(
+            Environment::same_runtime(&self.environment, &other.environment),
+            ForeignEnvironmentSnafu
+        );
+        let api = &self.environment.inner.api;
+        let mut comparison = -1;
+        // SAFETY: both descriptors are live and the output storage is writable.
+        status_call!(
+            api,
+            CompareMemoryInfo(self.as_ptr(), other.as_ptr(), &mut comparison)
+        )?;
+        Ok(comparison == 0)
     }
 }
 
@@ -145,6 +231,109 @@ impl Drop for MemoryInfo {
             api_function!(self.environment.inner.api, ReleaseMemoryInfo)(self.memory_info.as_ptr())
         };
     }
+}
+
+/// A session allocator for a specific memory descriptor.
+///
+/// Values allocated through this object borrow it because ONNX Runtime keeps
+/// calling the native allocator until the value is released.
+pub struct Allocator<'session> {
+    session: &'session Session,
+    allocator: NonNull<sys::OrtAllocator>,
+}
+
+impl Allocator<'_> {
+    /// Returns the native allocator pointer.
+    pub fn as_ptr(&self) -> *mut sys::OrtAllocator {
+        self.allocator.as_ptr()
+    }
+
+    /// Returns a copied snapshot of the allocator's memory descriptor.
+    pub fn memory_info(&self) -> Result<MemoryInfoDetails> {
+        let api = &self.session.environment.inner.api;
+        let mut memory_info = ptr::null();
+        // SAFETY: the allocator is live and output storage is writable.
+        status_call!(api, AllocatorGetInfo(self.as_ptr(), &mut memory_info))?;
+        let memory_info = require_non_null(memory_info.cast_mut(), "allocator memory info")?;
+        memory_info_details(api, memory_info)
+    }
+}
+
+impl Drop for Allocator<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the live session allocator.
+        unsafe {
+            api_function!(self.session.environment.inner.api, ReleaseAllocator)(self.as_ptr())
+        };
+    }
+}
+
+/// Native allocator strategy recorded in [`MemoryInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatorType {
+    /// Allocations are made directly by the device allocator.
+    Device,
+    /// Allocations are served from an arena.
+    Arena,
+}
+
+impl From<AllocatorType> for sys::OrtAllocatorType {
+    fn from(value: AllocatorType) -> Self {
+        match value {
+            AllocatorType::Device => Self::OrtDeviceAllocator,
+            AllocatorType::Arena => Self::OrtArenaAllocator,
+        }
+    }
+}
+
+/// Execution-provider memory usage recorded in [`MemoryInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryType {
+    /// CPU memory consumed by a non-CPU execution provider.
+    CpuInput,
+    /// CPU-accessible memory produced by a non-CPU execution provider.
+    CpuOutput,
+    /// The execution provider's default memory.
+    Default,
+}
+
+impl From<MemoryType> for sys::OrtMemType {
+    fn from(value: MemoryType) -> Self {
+        match value {
+            MemoryType::CpuInput => Self::OrtMemTypeCPUInput,
+            MemoryType::CpuOutput => Self::OrtMemTypeCPUOutput,
+            MemoryType::Default => Self::OrtMemTypeDefault,
+        }
+    }
+}
+
+/// Broad device category associated with tensor storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeviceType {
+    /// Host CPU memory.
+    Cpu,
+    /// GPU memory.
+    Gpu,
+    /// FPGA memory.
+    Fpga,
+    /// A device category introduced by a newer runtime.
+    Unknown(u32),
+}
+
+/// Copied fields from an ONNX Runtime memory descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryInfoDetails {
+    /// Allocator or execution-provider name.
+    pub name: String,
+    /// Native allocation strategy.
+    pub allocator_type: AllocatorType,
+    /// Execution-provider device identifier.
+    pub device_id: i32,
+    /// Execution-provider memory usage.
+    pub memory_type: MemoryType,
+    /// Broad device category.
+    pub device_type: DeviceType,
 }
 
 /// Rust element types that have an unambiguous ONNX tensor representation.
@@ -200,7 +389,10 @@ impl<'buffer> Value<'buffer> {
             Environment::same_runtime(&environment, &memory_info.environment),
             ForeignEnvironmentSnafu
         );
-        ensure!(memory_info.cpu_accessible, NonCpuMemorySnafu);
+        ensure!(
+            memory_info.device_type() == DeviceType::Cpu,
+            NonCpuMemorySnafu
+        );
         let shape = shape.as_ref();
         let expected = element_count(shape)?;
         ensure!(
@@ -271,15 +463,62 @@ impl<'buffer> Value<'buffer> {
         })
     }
 
+    /// Allocates a tensor from a session allocator.
+    ///
+    /// The returned value borrows `allocator`; the allocator must remain live
+    /// because ONNX Runtime uses it to release the tensor storage.
+    pub fn allocate_tensor_in<T: TensorElement>(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        shape: impl AsRef<[i64]>,
+    ) -> Result<Self> {
+        Self::allocate_tensor_in_with_type(environment, allocator, shape, T::ELEMENT_TYPE)
+    }
+
+    /// Allocates a tensor from a session allocator with an explicit type.
+    pub fn allocate_tensor_in_with_type(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        shape: impl AsRef<[i64]>,
+        element_type: ElementType,
+    ) -> Result<Self> {
+        ensure!(
+            Environment::same_runtime(&environment, &allocator.session.environment),
+            ForeignEnvironmentSnafu
+        );
+        let shape = shape.as_ref();
+        element_count(shape)?;
+        let api = &environment.inner.api;
+        let mut value = ptr::null_mut();
+        // SAFETY: allocator is retained through the returned lifetime, shape
+        // remains live for the call, and output storage is writable.
+        status_call!(
+            api,
+            CreateTensorAsOrtValue(
+                allocator.as_ptr(),
+                shape.as_ptr(),
+                shape.len(),
+                to_native_element_type(element_type),
+                &mut value,
+            )
+        )?;
+        Ok(Self {
+            environment,
+            value: NonNull::new(require_non_null(value, "allocated tensor value")?)
+                .expect("require_non_null returned a non-null pointer"),
+            _buffer: PhantomData,
+        })
+    }
+
     /// Adopts an owned native value returned by the same environment.
     ///
     /// # Safety
     ///
     /// `value` must be a uniquely owned live `OrtValue` created by
     /// `environment`. Ownership is transferred to the returned wrapper.
-    pub unsafe fn from_raw_owned(environment: &Environment, value: NonNull<sys::OrtValue>) -> Self {
+    pub unsafe fn from_raw_owned(environment: Environment, value: NonNull<sys::OrtValue>) -> Self {
         Self {
-            environment: environment.clone(),
+            environment,
             value,
             _buffer: PhantomData,
         }
@@ -333,6 +572,17 @@ impl<'buffer> Value<'buffer> {
         })
     }
 
+    /// Returns a copied snapshot of this tensor's memory descriptor.
+    pub fn memory_info(&self) -> Result<MemoryInfoDetails> {
+        ensure!(self.is_tensor()?, NotTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut memory_info = ptr::null();
+        // SAFETY: the value is live and output storage is writable.
+        status_call!(api, GetTensorMemoryInfo(self.as_ptr(), &mut memory_info))?;
+        let memory_info = require_non_null(memory_info.cast_mut(), "tensor memory info")?;
+        memory_info_details(api, memory_info)
+    }
+
     /// Borrows CPU tensor storage as a typed slice.
     pub fn as_slice<T: TensorElement>(&self) -> Result<&[T]> {
         let (pointer, length) = self.typed_data::<T>()?;
@@ -384,6 +634,45 @@ impl<'buffer> Value<'buffer> {
         let pointer = self.value.as_ptr();
         std::mem::forget(self);
         pointer
+    }
+}
+
+impl Value<'static> {
+    /// Allocates a tensor owned by ONNX Runtime using its default CPU allocator.
+    pub fn allocate_tensor<T: TensorElement>(
+        environment: Environment,
+        shape: impl AsRef<[i64]>,
+    ) -> Result<Self> {
+        Self::allocate_tensor_with_type(environment, shape, T::ELEMENT_TYPE)
+    }
+
+    /// Allocates a tensor with an explicitly selected ONNX element type.
+    pub fn allocate_tensor_with_type(
+        environment: Environment,
+        shape: impl AsRef<[i64]>,
+        element_type: ElementType,
+    ) -> Result<Self> {
+        let shape = shape.as_ref();
+        element_count(shape)?;
+        let api = &environment.inner.api;
+        let allocator = ffi::default_allocator(api)?;
+        let mut value = ptr::null_mut();
+        // SAFETY: the default allocator has process lifetime, shape remains
+        // live for the call, and output storage is writable.
+        status_call!(
+            api,
+            CreateTensorAsOrtValue(
+                allocator,
+                shape.as_ptr(),
+                shape.len(),
+                to_native_element_type(element_type),
+                &mut value,
+            )
+        )?;
+        let value = NonNull::new(require_non_null(value, "allocated tensor value")?)
+            .expect("require_non_null returned a non-null pointer");
+        // SAFETY: CreateTensorAsOrtValue transfers unique ownership to us.
+        Ok(unsafe { Self::from_raw_owned(environment, value) })
     }
 }
 
@@ -467,6 +756,29 @@ impl Session {
         self.session as *const sys::OrtSession
     }
 
+    /// Creates a session allocator for the requested memory location.
+    pub fn allocator<'session>(
+        &'session self,
+        memory_info: &MemoryInfo,
+    ) -> Result<Allocator<'session>> {
+        ensure!(
+            Environment::same_runtime(&self.environment, &memory_info.environment),
+            ForeignEnvironmentSnafu
+        );
+        let api = &self.environment.inner.api;
+        let mut allocator = ptr::null_mut();
+        // SAFETY: the session and descriptor are live and output storage is writable.
+        status_call!(
+            api,
+            CreateAllocator(self.as_ptr(), memory_info.as_ptr(), &mut allocator)
+        )?;
+        Ok(Allocator {
+            session: self,
+            allocator: NonNull::new(require_non_null(allocator, "session allocator")?)
+                .expect("require_non_null returned a non-null pointer"),
+        })
+    }
+
     /// Runs the session with low-level `OrtValue` inputs.
     pub fn run_raw(
         &self,
@@ -485,6 +797,96 @@ impl Session {
     ) -> Result<Vec<Value<'static>>> {
         ensure!(options.belongs_to(self), ForeignEnvironmentSnafu);
         self.run_raw_impl(inputs, output_names, Some(options))
+    }
+
+    /// Submits a low-level run to ONNX Runtime's native asynchronous API.
+    ///
+    /// Dropping an unfinished future requests cancellation and waits for the
+    /// native callback before releasing any borrowed input value.
+    pub fn run_raw_async<'a>(
+        &'a self,
+        inputs: &'a [Input<'a>],
+        output_names: &[&str],
+    ) -> Result<RawRunFuture<'a>> {
+        let options = self.run_options()?;
+        self.run_raw_async_with_options(inputs, output_names, options)
+    }
+
+    /// Submits a native asynchronous run with owned reusable run options.
+    pub fn run_raw_async_with_options<'a>(
+        &'a self,
+        inputs: &'a [Input<'a>],
+        output_names: &[&str],
+        options: RunOptions,
+    ) -> Result<RawRunFuture<'a>> {
+        ensure!(options.belongs_to(self), ForeignEnvironmentSnafu);
+        for input in inputs {
+            ensure!(
+                Environment::same_runtime(&self.environment, input.environment),
+                ForeignEnvironmentSnafu
+            );
+        }
+
+        let input_names = inputs
+            .iter()
+            .map(|input| input.name.clone())
+            .collect::<Vec<_>>();
+        let input_name_ptrs = input_names
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
+        let input_value_ptrs = inputs.iter().map(Input::value_ptr).collect::<Vec<_>>();
+        let output_names = output_names
+            .iter()
+            .map(|name| cstring(name, "raw output").map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let output_name_ptrs = output_names
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
+        let output_slots = vec![ptr::null_mut(); output_names.len()];
+        let api = &self.environment.inner.api;
+        let completion = Arc::new(AsyncCompletion::new(api.clone(), output_names.len()));
+        let mut future = RawRunFuture {
+            session: self,
+            environment: self.environment.clone(),
+            completion,
+            run_options: options,
+            _input_names: input_names,
+            input_name_ptrs,
+            input_value_ptrs,
+            _output_names: output_names,
+            output_name_ptrs,
+            output_slots,
+            _input_borrow: PhantomData,
+            finished: false,
+        };
+
+        let callback_state = Arc::into_raw(future.completion.clone());
+        // SAFETY: every pointer array is retained in the future, the input
+        // borrow lasts until callback completion, and callback_state contains
+        // exactly one strong Arc reference reclaimed by async_run_callback.
+        let status = unsafe {
+            api_function!(api, RunAsync)(
+                self.session as *mut sys::OrtSession,
+                future.run_options.as_ptr(),
+                future.input_name_ptrs.as_ptr(),
+                future.input_value_ptrs.as_ptr(),
+                future.input_value_ptrs.len(),
+                future.output_name_ptrs.as_ptr(),
+                future.output_name_ptrs.len(),
+                future.output_slots.as_mut_ptr(),
+                Some(async_run_callback),
+                callback_state.cast_mut().cast(),
+            )
+        };
+        if !status.is_null() {
+            // SAFETY: submission failed, so ORT will not invoke the callback.
+            unsafe { drop(Arc::from_raw(callback_state)) };
+            future.finished = true;
+            check_status(api, status)?;
+        }
+        Ok(future)
     }
 
     /// Runs with caller-owned, preallocated low-level outputs.
@@ -560,7 +962,7 @@ impl Session {
             .map(|value| {
                 let value = NonNull::new(value).expect("output null pointers were rejected");
                 // SAFETY: successful Run transfers each output to the caller.
-                Ok(unsafe { Value::from_raw_owned(&self.environment, value) })
+                Ok(unsafe { Value::from_raw_owned(self.environment.clone(), value) })
             })
             .collect()
     }
@@ -629,6 +1031,76 @@ impl Session {
     }
 }
 
+/// Future returned by [`Session::run_raw_async`].
+#[must_use = "futures do nothing unless awaited or polled"]
+pub struct RawRunFuture<'a> {
+    session: &'a Session,
+    environment: Environment,
+    completion: Arc<AsyncCompletion>,
+    run_options: RunOptions,
+    _input_names: Vec<CString>,
+    input_name_ptrs: Vec<*const std::ffi::c_char>,
+    input_value_ptrs: Vec<*const sys::OrtValue>,
+    _output_names: Vec<CString>,
+    output_name_ptrs: Vec<*const std::ffi::c_char>,
+    output_slots: Vec<*mut sys::OrtValue>,
+    _input_borrow: PhantomData<&'a [Input<'a>]>,
+    finished: bool,
+}
+
+impl Future for RawRunFuture<'_> {
+    type Output = Result<Vec<Value<'static>>>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(!self.finished, "RawRunFuture polled after completion");
+        let Some(result) = self.completion.poll_result(context.waker()) else {
+            return Poll::Pending;
+        };
+        self.finished = true;
+        Poll::Ready(match result {
+            Ok(values) => Ok(values
+                .into_iter()
+                .map(|value| {
+                    let value = NonNull::new(value as *mut sys::OrtValue)
+                        .expect("async completion rejected null outputs");
+                    // SAFETY: callback completion transfers unique ownership.
+                    unsafe { Value::from_raw_owned(self.environment.clone(), value) }
+                })
+                .collect()),
+            Err(source) => Err(Error::Async { source }),
+        })
+    }
+}
+
+impl RawRunFuture<'_> {
+    /// Requests cooperative cancellation of the native run.
+    pub fn cancel(&self) -> Result<()> {
+        self.run_options.terminate()?;
+        Ok(())
+    }
+}
+
+impl Drop for RawRunFuture<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = self.run_options.terminate();
+        if let Ok(values) = self.completion.wait_result() {
+            for value in values {
+                // SAFETY: successful callback outputs not consumed by poll are
+                // uniquely owned by this future.
+                unsafe {
+                    api_function!(self.session.environment.inner.api, ReleaseValue)(
+                        value as *mut sys::OrtValue,
+                    )
+                };
+            }
+        }
+        self.finished = true;
+    }
+}
+
 impl Environment {
     /// Returns the loaded ONNX Runtime C API table.
     pub fn raw_api(&self) -> &sys::Api {
@@ -641,6 +1113,80 @@ fn release_values(api: &sys::Api, values: Vec<*mut sys::OrtValue>) {
         // SAFETY: each non-null output is uniquely owned by the failed run.
         unsafe { api_function!(api, ReleaseValue)(value) };
     }
+}
+
+fn memory_info_name(api: &sys::Api, memory_info: *const sys::OrtMemoryInfo) -> Result<String> {
+    let mut name = ptr::null();
+    // SAFETY: memory_info is live and output storage is writable. The returned
+    // string is owned by memory_info and callers tie the borrow accordingly.
+    status_call!(api, MemoryInfoGetName(memory_info, &mut name))?;
+    let name = require_non_null(name.cast_mut(), "memory info name")?;
+    // SAFETY: ONNX Runtime documents this as a NUL-terminated string valid for
+    // the lifetime of memory_info. Copy it before returning.
+    Ok(unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn memory_info_allocator_type(
+    api: &sys::Api,
+    memory_info: *const sys::OrtMemoryInfo,
+) -> Result<AllocatorType> {
+    let mut allocator_type = sys::OrtAllocatorType::OrtInvalidAllocator;
+    // SAFETY: memory_info is live and output storage is writable.
+    status_call!(api, MemoryInfoGetType(memory_info, &mut allocator_type))?;
+    match allocator_type {
+        sys::OrtAllocatorType::OrtDeviceAllocator => Ok(AllocatorType::Device),
+        sys::OrtAllocatorType::OrtArenaAllocator => Ok(AllocatorType::Arena),
+        value => Err(Error::UnknownAllocatorType { value: value.0 }),
+    }
+}
+
+fn memory_info_device_id(api: &sys::Api, memory_info: *const sys::OrtMemoryInfo) -> Result<i32> {
+    let mut device_id = 0;
+    // SAFETY: memory_info is live and output storage is writable.
+    status_call!(api, MemoryInfoGetId(memory_info, &mut device_id))?;
+    Ok(device_id)
+}
+
+fn memory_info_memory_type(
+    api: &sys::Api,
+    memory_info: *const sys::OrtMemoryInfo,
+) -> Result<MemoryType> {
+    let mut memory_type = sys::OrtMemType::OrtMemTypeDefault;
+    // SAFETY: memory_info is live and output storage is writable.
+    status_call!(api, MemoryInfoGetMemType(memory_info, &mut memory_type))?;
+    match memory_type {
+        sys::OrtMemType::OrtMemTypeCPUInput => Ok(MemoryType::CpuInput),
+        sys::OrtMemType::OrtMemTypeCPUOutput => Ok(MemoryType::CpuOutput),
+        sys::OrtMemType::OrtMemTypeDefault => Ok(MemoryType::Default),
+        value => Err(Error::UnknownMemoryType { value: value.0 }),
+    }
+}
+
+fn memory_info_device_type(api: &sys::Api, memory_info: *const sys::OrtMemoryInfo) -> DeviceType {
+    let mut device_type = sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU;
+    // SAFETY: memory_info is live and output storage is writable.
+    unsafe { api_function!(api, MemoryInfoGetDeviceType)(memory_info, &mut device_type) };
+    match device_type {
+        sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU => DeviceType::Cpu,
+        sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_GPU => DeviceType::Gpu,
+        sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA => DeviceType::Fpga,
+        value => DeviceType::Unknown(value.0),
+    }
+}
+
+fn memory_info_details(
+    api: &sys::Api,
+    memory_info: *const sys::OrtMemoryInfo,
+) -> Result<MemoryInfoDetails> {
+    Ok(MemoryInfoDetails {
+        name: memory_info_name(api, memory_info)?,
+        allocator_type: memory_info_allocator_type(api, memory_info)?,
+        device_id: memory_info_device_id(api, memory_info)?,
+        memory_type: memory_info_memory_type(api, memory_info)?,
+        device_type: memory_info_device_type(api, memory_info),
+    })
 }
 
 fn element_count(shape: &[i64]) -> Result<usize> {

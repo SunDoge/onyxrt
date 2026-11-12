@@ -110,6 +110,13 @@ let output: &[f32] = outputs[0].as_slice()?;
 # let _ = output;
 ```
 
+`Value::allocate_tensor` creates an ORT-owned CPU tensor. For provider memory,
+create a session `Allocator` from a `MemoryInfo` and use
+`Value::allocate_tensor_in`; the resulting value is lifetime-bound to the
+allocator so the native allocator cannot be released too early. Memory
+descriptors expose their name, allocator type, device id, memory type, and
+CPU/GPU/FPGA device category.
+
 For direct extensions, `Environment::raw_api`, `Session::as_ptr`,
 `RunOptions::as_ptr`, `MemoryInfo::as_ptr`, and `Value::{as_ptr, as_mut_ptr,
 into_raw}` expose the underlying handles without transferring ownership unless
@@ -122,11 +129,13 @@ it as an owning DLPack tensor.
 
 ## Asynchronous runs
 
-`Session::run_all_async` wraps ONNX Runtime's native callback-based `RunAsync`
-as a Rust `Future` without requiring Tokio or another runtime dependency:
+`Session::run_all_async` and `Session::run_raw_async` wrap ONNX Runtime's
+native callback-based `RunAsync` as Rust futures without requiring Tokio or
+another runtime dependency:
 
 ```rust,ignore
 let outputs = session.run_all_async(&inputs)?.await?;
+let raw_outputs = session.run_raw_async(&raw_inputs, &["output"])?.await?;
 ```
 
 ORT schedules this work on its own intra-op thread pool. Dropping an unfinished

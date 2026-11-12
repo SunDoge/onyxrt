@@ -308,7 +308,7 @@ impl AsyncCompletion {
         }
     }
 
-    fn poll_result(&self, waker: &Waker) -> Option<Result<Vec<usize>>> {
+    pub(super) fn poll_result(&self, waker: &Waker) -> Option<Result<Vec<usize>>> {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if inner.result.is_some() {
             inner.result.take()
@@ -324,7 +324,7 @@ impl AsyncCompletion {
         }
     }
 
-    fn wait_result(&self) -> Result<Vec<usize>> {
+    pub(super) fn wait_result(&self) -> Result<Vec<usize>> {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         while inner.result.is_none() {
             inner = self
