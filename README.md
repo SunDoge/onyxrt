@@ -315,3 +315,8 @@ committed output without modifying it:
 cargo xtask download-header --check
 cargo xtask bindgen --check
 ```
+
+## License
+
+onyxrt is licensed under the MIT License. The generated ONNX Runtime bindings
+retain Microsoft's copyright notice and MIT license.

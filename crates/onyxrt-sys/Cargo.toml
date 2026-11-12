@@ -12,7 +12,13 @@ readme.workspace = true
 documentation = "https://docs.rs/onyxrt-sys"
 keywords = ["onnx", "onnxruntime", "ffi", "bindings", "machine-learning"]
 categories = ["api-bindings", "science"]
-include = ["src/**", "CHANGELOG.md", "../../README.md", "LICENSE-*"]
+include = [
+    "src/**",
+    "CHANGELOG.md",
+    "../../README.md",
+    "LICENSE-MIT",
+    "LICENSE-ONNXRUNTIME",
+]
 
 [lib]
 doctest = false
