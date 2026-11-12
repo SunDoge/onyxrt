@@ -20,7 +20,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
       - name: Publish with release-plz
         uses: release-plz/action@v0.5
         with:
@@ -45,7 +47,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
       - name: Create or update release PR
         uses: release-plz/action@v0.5
         with:
