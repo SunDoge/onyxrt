@@ -11,3 +11,7 @@ version_group = "onyxrt"
 [[package]]
 name = "onyxrt"
 version_group = "onyxrt"
+
+[[package]]
+name = "xtask"
+release = false

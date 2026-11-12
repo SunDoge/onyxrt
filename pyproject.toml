@@ -1,0 +1,8 @@
+[project]
+name = "onyxrt-tests"
+version = "0.0.0"
+requires-python = ">=3.12, <3.13"
+dependencies = ["onnxruntime==1.21.0"]
+
+[tool.uv]
+package = false
