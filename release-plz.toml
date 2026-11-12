@@ -1,0 +1,13 @@
+[workspace]
+dependencies_update = false
+git_only = true
+release_always = false
+
+[[package]]
+name = "onyxrt-sys"
+git_release_enable = false
+version_group = "onyxrt"
+
+[[package]]
+name = "onyxrt"
+version_group = "onyxrt"
