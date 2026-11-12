@@ -79,6 +79,9 @@ pub enum Error {
     #[snafu(display("ONNX Runtime returned unknown memory type {value}"))]
     UnknownMemoryType { value: i32 },
 
+    #[snafu(display("container index {index} exceeds ONNX Runtime's i32 index range"))]
+    ContainerIndexOverflow { index: usize },
+
     #[snafu(display("ONNX Runtime replaced preallocated raw output `{name}`"))]
     ReplacedOutput { name: String },
 }
@@ -543,6 +546,43 @@ impl<'buffer> Value<'buffer> {
         Ok(is_tensor != 0)
     }
 
+    /// Returns the ONNX value category.
+    pub fn value_type(&self) -> Result<ValueType> {
+        let api = &self.environment.inner.api;
+        let mut value_type = sys::ONNXType::ONNX_TYPE_UNKNOWN;
+        // SAFETY: the value is live and output storage is writable.
+        status_call!(api, GetValueType(self.as_ptr(), &mut value_type))?;
+        Ok(value_type.into())
+    }
+
+    /// Returns the child count of a sequence, map, or optional value.
+    pub fn value_count(&self) -> Result<usize> {
+        let api = &self.environment.inner.api;
+        let mut count = 0;
+        // SAFETY: the value is live and output storage is writable. ORT
+        // validates that this value category supports child access.
+        status_call!(api, GetValueCount(self.as_ptr(), &mut count))?;
+        Ok(count)
+    }
+
+    /// Copies one child from a sequence, map, or optional value.
+    ///
+    /// ONNX Runtime uses its process-lifetime default CPU allocator for the
+    /// returned value, so the child does not borrow its parent.
+    pub fn value_at(&self, index: usize) -> Result<Value<'static>> {
+        let index = i32::try_from(index).map_err(|_| Error::ContainerIndexOverflow { index })?;
+        let api = &self.environment.inner.api;
+        let allocator = ffi::default_allocator(api)?;
+        let mut value = ptr::null_mut();
+        // SAFETY: the parent and allocator are live and output storage is
+        // writable. ORT validates the index against the container.
+        status_call!(api, GetValue(self.as_ptr(), index, allocator, &mut value))?;
+        let value = NonNull::new(require_non_null(value, "container child value")?)
+            .expect("require_non_null returned a non-null pointer");
+        // SAFETY: GetValue transfers unique ownership of the copied child.
+        Ok(unsafe { Value::from_raw_owned(self.environment.clone(), value) })
+    }
+
     /// Returns the tensor element type and shape.
     pub fn tensor_info(&self) -> Result<TensorInfo> {
         ensure!(self.is_tensor()?, NotTensorSnafu);
@@ -690,6 +730,43 @@ pub struct TensorInfo {
     pub element_type: ElementType,
     /// Concrete tensor dimensions.
     pub shape: Vec<i64>,
+}
+
+/// ONNX category stored in a low-level [`Value`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ValueType {
+    /// The runtime did not identify the category.
+    Unknown,
+    /// A dense tensor.
+    Tensor,
+    /// A sequence of values.
+    Sequence,
+    /// A key/value map represented by two child values.
+    Map,
+    /// A runtime-specific opaque value.
+    Opaque,
+    /// A sparse tensor.
+    SparseTensor,
+    /// An optional value with zero or one child.
+    Optional,
+    /// A category introduced by a newer runtime.
+    Other(u32),
+}
+
+impl From<sys::ONNXType> for ValueType {
+    fn from(value: sys::ONNXType) -> Self {
+        match value {
+            sys::ONNXType::ONNX_TYPE_UNKNOWN => Self::Unknown,
+            sys::ONNXType::ONNX_TYPE_TENSOR => Self::Tensor,
+            sys::ONNXType::ONNX_TYPE_SEQUENCE => Self::Sequence,
+            sys::ONNXType::ONNX_TYPE_MAP => Self::Map,
+            sys::ONNXType::ONNX_TYPE_OPAQUE => Self::Opaque,
+            sys::ONNXType::ONNX_TYPE_SPARSETENSOR => Self::SparseTensor,
+            sys::ONNXType::ONNX_TYPE_OPTIONAL => Self::Optional,
+            value => Self::Other(value.0),
+        }
+    }
 }
 
 /// A named borrowed value supplied to [`Session::run_raw`].

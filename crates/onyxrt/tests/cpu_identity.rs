@@ -12,7 +12,7 @@ use onyxrt::{
     },
     raw::{
         AllocatorType, DeviceType, Input as RawInput, MemoryInfo, MemoryType, Output as RawOutput,
-        Value as RawValue,
+        Value as RawValue, ValueType as RawValueType,
     },
     value::{
         Input, InputValue, IoBindingDeviceOutput, IoBindingInput, IoBindingOutput, MapInput,
@@ -229,6 +229,42 @@ fn cpu_dlpack_identity_round_trip() {
         .session_builder()
         .build_from_bytes(SEQUENCE_MODEL)
         .unwrap();
+    let mut raw_sequence_x = [3.0_f32];
+    let mut raw_sequence_y = [-4.0_f32];
+    let raw_sequence_x =
+        RawValue::tensor(environment.clone(), &memory_info, &mut raw_sequence_x, [1]).unwrap();
+    let raw_sequence_y =
+        RawValue::tensor(environment.clone(), &memory_info, &mut raw_sequence_y, [1]).unwrap();
+    let raw_sequence_inputs = [
+        RawInput::new("x", &raw_sequence_x).unwrap(),
+        RawInput::new("y", &raw_sequence_y).unwrap(),
+    ];
+    let raw_sequence_output = sequence_session
+        .run_raw(&raw_sequence_inputs, &["z"])
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        raw_sequence_output.value_type().unwrap(),
+        RawValueType::Sequence
+    );
+    assert_eq!(raw_sequence_output.value_count().unwrap(), 2);
+    assert_eq!(
+        raw_sequence_output
+            .value_at(0)
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap(),
+        &[3.0]
+    );
+    assert_eq!(
+        raw_sequence_output
+            .value_at(1)
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap(),
+        &[-4.0]
+    );
+
     let sequence_metadata = sequence_session.output_values().unwrap();
     assert_eq!(sequence_metadata[0].name(), "z");
     let ValueTypeInfo::Sequence(element) = sequence_metadata[0].value_type() else {
