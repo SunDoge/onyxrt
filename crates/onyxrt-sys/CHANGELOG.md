@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/SunDoge/onyxrt/compare/onyxrt-sys-v0.1.1...onyxrt-sys-v0.2.0) - 2026-11-12
+
+### Added
+
+- expand tensor memory support
+- [**breaking**] split value ownership and add DLPack export
+
 ### Changed
 
 - update generated bindings and the minimum runtime to ONNX Runtime 1.31.1
