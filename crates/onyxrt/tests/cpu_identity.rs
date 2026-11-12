@@ -12,8 +12,9 @@ use onyxrt::{
     },
     raw::{
         AllocatorType, DeviceType, Input as RawInput, MemoryInfo, MemoryType, Output as RawOutput,
-        Value as RawValue, ValueType as RawValueType,
+        SparseFormat, Value as RawValue, ValueType as RawValueType,
     },
+    session::{ExternalInitializer, LoraAdapter},
     value::{
         Input, InputValue, IoBindingDeviceOutput, IoBindingInput, IoBindingOutput, MapInput,
         OutputBuffer, SequenceInput, StringInput, Value, ValueInput,
@@ -32,6 +33,23 @@ const IDENTITY_MODEL: &[u8] = &[
     0x03, // input float[3]
     0x62, 0x0f, 0x0a, 0x01, b'y', 0x12, 0x0a, 0x0a, 0x08, 0x08, 0x01, 0x12, 0x04, 0x0a, 0x02, 0x08,
     0x03, // output float[3]
+];
+
+// float[3] y = Add(float[3] x, external float[3] initializer w), opset 13.
+const EXTERNAL_ADD_MODEL: &[u8] = &[
+    0x08, 0x08, 0x3a, 0x7f, 0x0a, 0x0e, 0x0a, 0x01, 0x78, 0x0a, 0x01, 0x77, 0x12, 0x01, 0x79, 0x22,
+    0x03, 0x41, 0x64, 0x64, 0x12, 0x0c, 0x65, 0x78, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x5f, 0x61,
+    0x64, 0x64, 0x2a, 0x3d, 0x08, 0x03, 0x10, 0x01, 0x42, 0x01, 0x77, 0x6a, 0x17, 0x0a, 0x08, 0x6c,
+    0x6f, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x0b, 0x77, 0x65, 0x69, 0x67, 0x68, 0x74, 0x73,
+    0x2e, 0x62, 0x69, 0x6e, 0x6a, 0x0b, 0x0a, 0x06, 0x6f, 0x66, 0x66, 0x73, 0x65, 0x74, 0x12, 0x01,
+    0x30, 0x6a, 0x0c, 0x0a, 0x06, 0x6c, 0x65, 0x6e, 0x67, 0x74, 0x68, 0x12, 0x02, 0x31, 0x32, 0x70,
+    0x01, 0x5a, 0x0f, 0x0a, 0x01, 0x78, 0x12, 0x0a, 0x0a, 0x08, 0x08, 0x01, 0x12, 0x04, 0x0a, 0x02,
+    0x08, 0x03, 0x62, 0x0f, 0x0a, 0x01, 0x79, 0x12, 0x0a, 0x0a, 0x08, 0x08, 0x01, 0x12, 0x04, 0x0a,
+    0x02, 0x08, 0x03, 0x42, 0x04, 0x0a, 0x00, 0x10, 0x0d,
+];
+
+const EXTERNAL_ADD_WEIGHTS: &[u8] = &[
+    0x00, 0x00, 0x20, 0x41, 0x00, 0x00, 0xa0, 0x41, 0x00, 0x00, 0xf0, 0x41,
 ];
 
 // float[1] x, y -> sequence<float[1]> z = SequenceConstruct(x, y), opset 13.
@@ -98,6 +116,7 @@ fn cpu_dlpack_identity_round_trip() {
         providers.iter().any(|name| name == "CPUExecutionProvider"),
         "available providers did not include CPUExecutionProvider: {providers:?}"
     );
+    assert!(LoraAdapter::from_bytes(environment.clone(), b"not a LoRA adapter").is_err());
 
     let model_path =
         std::env::temp_dir().join(format!("onyxrt-identity-{}.onnx", std::process::id()));
@@ -161,6 +180,21 @@ fn cpu_dlpack_identity_round_trip() {
         &[1.5, -2.0, 7.25]
     );
 
+    let mut raw_bound_data = [0.0_f32; 3];
+    let mut raw_bound_value =
+        RawValue::tensor(environment.clone(), &memory_info, &mut raw_bound_data, [3]).unwrap();
+    {
+        let mut binding = session.io_binding().unwrap();
+        let mut outputs = [RawOutput::new("y", &mut raw_bound_value).unwrap()];
+        let mut bound = binding.bind_raw(&raw_inputs, &mut outputs).unwrap();
+        bound.run().unwrap();
+        bound.run().unwrap();
+    }
+    assert_eq!(
+        raw_bound_value.as_slice::<f32>().unwrap(),
+        &[1.5, -2.0, 7.25]
+    );
+
     let mut allocated_output = RawValue::allocate_tensor::<f32>(environment.clone(), [3]).unwrap();
     {
         let mut outputs = [RawOutput::new("y", &mut allocated_output).unwrap()];
@@ -196,6 +230,53 @@ fn cpu_dlpack_identity_round_trip() {
         session_allocated_output.as_slice::<f32>().unwrap(),
         &[1.5, -2.0, 7.25]
     );
+    let sparse = RawValue::sparse_coo(
+        environment.clone(),
+        &allocator,
+        &memory_info,
+        [4],
+        [2],
+        &[5.0_f32, 7.0],
+        &[0_i64, 3],
+    )
+    .unwrap();
+    assert!(sparse.is_sparse_tensor().unwrap());
+    assert_eq!(sparse.value_type().unwrap(), RawValueType::SparseTensor);
+    assert_eq!(sparse.sparse_format().unwrap(), SparseFormat::Coo);
+    // SAFETY: sparse was allocated and filled through CPU memory descriptors.
+    let sparse_values = unsafe { sparse.sparse_values::<f32>() }.unwrap();
+    assert_eq!(sparse_values, &[5.0, 7.0]);
+    // SAFETY: sparse was allocated and filled through CPU memory descriptors.
+    assert_eq!(unsafe { sparse.sparse_coo_indices() }.unwrap(), &[0, 3]);
+
+    let external_file_session = environment
+        .session_builder()
+        .external_data_file("weights.bin", EXTERNAL_ADD_WEIGHTS)
+        .build_from_bytes(EXTERNAL_ADD_MODEL)
+        .unwrap();
+    let external_file_outputs = external_file_session.run_raw(&raw_inputs, &["y"]).unwrap();
+    assert_eq!(
+        external_file_outputs[0].as_slice::<f32>().unwrap(),
+        &[11.5, 18.0, 37.25]
+    );
+
+    let external_initializer_session = {
+        let mut weights = [1.0_f32, 2.0, 3.0];
+        let weights =
+            RawValue::tensor(environment.clone(), &memory_info, &mut weights, [3]).unwrap();
+        let initializers = [ExternalInitializer::new("w", &weights).unwrap()];
+        environment
+            .session_builder()
+            .build_from_bytes_with_external_initializers(EXTERNAL_ADD_MODEL, &initializers)
+            .unwrap()
+    };
+    let external_initializer_outputs = external_initializer_session
+        .run_raw(&raw_inputs, &["y"])
+        .unwrap();
+    assert_eq!(
+        external_initializer_outputs[0].as_slice::<f32>().unwrap(),
+        &[2.5, 0.0, 10.25]
+    );
 
     let mut string_model = IDENTITY_MODEL.to_vec();
     let element_type_offsets = string_model
@@ -224,6 +305,16 @@ fn cpu_dlpack_identity_round_trip() {
         Value::Tensor(_) => panic!("string Identity returned a numeric tensor"),
         _ => panic!("string Identity returned a container value"),
     }
+    let mut async_string_outputs = block_on(
+        string_session
+            .run_values_async(&string_inputs, &["y"])
+            .unwrap(),
+    )
+    .unwrap();
+    let Value::Strings(async_strings) = async_string_outputs.remove(0).into_value() else {
+        panic!("async string Identity returned a non-string value");
+    };
+    assert_eq!(async_strings.values(), &["hello", "", "世界"]);
 
     let sequence_session = environment
         .session_builder()

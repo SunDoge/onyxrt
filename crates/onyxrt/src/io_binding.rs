@@ -16,6 +16,7 @@ use crate::{
         self, IoBindingGuard, MemoryInfoGuard, ValueGuard, api_function, check_status, status_call,
     },
     model::Environment,
+    raw::{Input as RawInput, Output as RawOutput},
     session::{RunOptions, Session},
     value::{
         self, Input, IoBindingInput, IoBindingOutput, Output, create_dlpack_memory_info,
@@ -41,6 +42,9 @@ pub enum Error {
 
     #[snafu(display("run options belong to a different ONNX Runtime environment"))]
     ForeignRunOptions,
+
+    #[snafu(display("raw value belongs to a different ONNX Runtime environment"))]
+    ForeignRawValue,
 
     #[snafu(display("ONNX Runtime returned null for {what}"))]
     NullPointer { what: &'static str },
@@ -130,6 +134,50 @@ impl<'session> IoBinding<'session> {
         })
     }
 
+    /// Binds caller-owned low-level values for repeated synchronized runs.
+    pub fn bind_raw<'binding>(
+        &'binding mut self,
+        inputs: &'binding [RawInput<'binding>],
+        outputs: &'binding mut [RawOutput<'binding>],
+    ) -> Result<BoundRawIoBinding<'binding, 'session>> {
+        self.clear();
+        let session = self.session;
+        let api = &session.environment.inner.api;
+        let result = (|| {
+            for input in inputs {
+                ensure!(
+                    Environment::same_runtime(&session.environment, input.environment()),
+                    ForeignRawValueSnafu
+                );
+                // SAFETY: the scoped result retains the raw value borrow until clear.
+                status_call!(
+                    api,
+                    BindInput(self.binding, input.name().as_ptr(), input.value_ptr())
+                )?;
+            }
+            for output in outputs.iter() {
+                ensure!(
+                    Environment::same_runtime(&session.environment, output.environment()),
+                    ForeignRawValueSnafu
+                );
+                // SAFETY: output storage remains exclusively borrowed until clear.
+                status_call!(
+                    api,
+                    BindOutput(self.binding, output.name().as_ptr(), output.value_ptr())
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.clear();
+            return Err(error);
+        }
+        Ok(BoundRawIoBinding {
+            binding: self,
+            _borrows: PhantomData,
+        })
+    }
+
     /// Clears all native input and output bindings.
     pub fn clear(&mut self) {
         let api = &self.session.environment.inner.api;
@@ -148,6 +196,53 @@ impl Drop for IoBinding<'_> {
         unsafe {
             api_function!(self.session.environment.inner.api, ReleaseIoBinding)(self.binding)
         };
+    }
+}
+
+/// A scoped set of caller-owned low-level values attached to an I/O binding.
+pub struct BoundRawIoBinding<'binding, 'session> {
+    binding: &'binding mut IoBinding<'session>,
+    _borrows: PhantomData<&'binding mut ()>,
+}
+
+impl BoundRawIoBinding<'_, '_> {
+    /// Executes and synchronizes the raw bindings once.
+    pub fn run(&mut self) -> Result<()> {
+        self.run_impl(None)
+    }
+
+    /// Executes raw bindings with explicit reusable run options.
+    pub fn run_with_options(&mut self, options: &RunOptions) -> Result<()> {
+        ensure!(
+            options.belongs_to(self.binding.session),
+            ForeignRunOptionsSnafu
+        );
+        self.run_impl(Some(options))
+    }
+
+    fn run_impl(&mut self, options: Option<&RunOptions>) -> Result<()> {
+        let session = self.binding.session;
+        let api = &session.environment.inner.api;
+        // SAFETY: every bound input remains borrowed and live.
+        status_call!(api, SynchronizeBoundInputs(self.binding.binding))?;
+        // SAFETY: session, binding, options, and all values remain live.
+        status_call!(
+            api,
+            RunWithBinding(
+                session.session as *mut sys::OrtSession,
+                options.map_or(ptr::null(), RunOptions::as_ptr),
+                self.binding.binding,
+            )
+        )?;
+        // SAFETY: synchronize provider writes before exposing output storage.
+        status_call!(api, SynchronizeBoundOutputs(self.binding.binding))?;
+        Ok(())
+    }
+}
+
+impl Drop for BoundRawIoBinding<'_, '_> {
+    fn drop(&mut self) {
+        self.binding.clear();
     }
 }
 

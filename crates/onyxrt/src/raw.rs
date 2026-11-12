@@ -61,6 +61,9 @@ pub enum Error {
     #[snafu(display("OrtValue is not a dense tensor"))]
     NotTensor,
 
+    #[snafu(display("OrtValue is not a sparse tensor"))]
+    NotSparseTensor,
+
     #[snafu(display("tensor has element type {actual:?}, expected {expected:?}"))]
     ElementTypeMismatch {
         expected: ElementType,
@@ -381,6 +384,10 @@ pub struct Value<'buffer> {
 }
 
 impl<'buffer> Value<'buffer> {
+    pub(super) fn environment(&self) -> &Environment {
+        &self.environment
+    }
+
     /// Creates a tensor backed directly by a mutable Rust slice.
     pub fn tensor<T: TensorElement>(
         environment: Environment,
@@ -513,6 +520,177 @@ impl<'buffer> Value<'buffer> {
         })
     }
 
+    /// Creates an allocator-owned COO sparse tensor by copying CPU slices.
+    pub fn sparse_coo<T: TensorElement>(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        source_memory: &MemoryInfo,
+        dense_shape: impl AsRef<[i64]>,
+        values_shape: impl AsRef<[i64]>,
+        values: &[T],
+        indices: &[i64],
+    ) -> Result<Self> {
+        let values_shape = values_shape.as_ref();
+        validate_sparse_source(
+            &environment,
+            allocator,
+            source_memory,
+            values_shape,
+            values.len(),
+        )?;
+        let mut value = Self::allocate_sparse(
+            environment,
+            allocator,
+            dense_shape.as_ref(),
+            T::ELEMENT_TYPE,
+        )?;
+        let value_ptr = value.as_mut_ptr();
+        let api = &value.environment.inner.api;
+        // SAFETY: source slices and descriptor are CPU-resident and live for
+        // this copying call; value is an empty allocator-owned sparse tensor.
+        status_call!(
+            api,
+            FillSparseTensorCoo(
+                value_ptr,
+                source_memory.as_ptr(),
+                values_shape.as_ptr(),
+                values_shape.len(),
+                values.as_ptr().cast(),
+                indices.as_ptr(),
+                indices.len(),
+            )
+        )?;
+        Ok(value)
+    }
+
+    /// Creates an allocator-owned CSR sparse tensor by copying CPU slices.
+    pub fn sparse_csr<T: TensorElement>(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        source_memory: &MemoryInfo,
+        dense_shape: impl AsRef<[i64]>,
+        values_shape: impl AsRef<[i64]>,
+        values: &[T],
+        indices: CsrIndices<'_>,
+    ) -> Result<Self> {
+        let values_shape = values_shape.as_ref();
+        validate_sparse_source(
+            &environment,
+            allocator,
+            source_memory,
+            values_shape,
+            values.len(),
+        )?;
+        let mut value = Self::allocate_sparse(
+            environment,
+            allocator,
+            dense_shape.as_ref(),
+            T::ELEMENT_TYPE,
+        )?;
+        let value_ptr = value.as_mut_ptr();
+        let api = &value.environment.inner.api;
+        // SAFETY: all source slices are CPU-resident and copied synchronously.
+        status_call!(
+            api,
+            FillSparseTensorCsr(
+                value_ptr,
+                source_memory.as_ptr(),
+                values_shape.as_ptr(),
+                values_shape.len(),
+                values.as_ptr().cast(),
+                indices.inner.as_ptr(),
+                indices.inner.len(),
+                indices.outer.as_ptr(),
+                indices.outer.len(),
+            )
+        )?;
+        Ok(value)
+    }
+
+    /// Creates an allocator-owned block-sparse tensor by copying CPU slices.
+    pub fn sparse_block<T: TensorElement>(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        source_memory: &MemoryInfo,
+        dense_shape: impl AsRef<[i64]>,
+        values_shape: impl AsRef<[i64]>,
+        values: &[T],
+        indices: BlockSparseIndices<'_>,
+    ) -> Result<Self> {
+        let values_shape = values_shape.as_ref();
+        validate_sparse_source(
+            &environment,
+            allocator,
+            source_memory,
+            values_shape,
+            values.len(),
+        )?;
+        let expected_indices = element_count(indices.shape)?;
+        ensure!(
+            expected_indices == indices.values.len(),
+            ElementCountSnafu {
+                expected: expected_indices,
+                actual: indices.values.len()
+            }
+        );
+        let mut value = Self::allocate_sparse(
+            environment,
+            allocator,
+            dense_shape.as_ref(),
+            T::ELEMENT_TYPE,
+        )?;
+        let value_ptr = value.as_mut_ptr();
+        let api = &value.environment.inner.api;
+        // SAFETY: all source slices are CPU-resident and copied synchronously.
+        status_call!(
+            api,
+            FillSparseTensorBlockSparse(
+                value_ptr,
+                source_memory.as_ptr(),
+                values_shape.as_ptr(),
+                values_shape.len(),
+                values.as_ptr().cast(),
+                indices.shape.as_ptr(),
+                indices.shape.len(),
+                indices.values.as_ptr(),
+            )
+        )?;
+        Ok(value)
+    }
+
+    fn allocate_sparse(
+        environment: Environment,
+        allocator: &'buffer Allocator<'_>,
+        dense_shape: &[i64],
+        element_type: ElementType,
+    ) -> Result<Self> {
+        ensure!(
+            Environment::same_runtime(&environment, &allocator.session.environment),
+            ForeignEnvironmentSnafu
+        );
+        element_count(dense_shape)?;
+        let api = &environment.inner.api;
+        let mut value = ptr::null_mut();
+        // SAFETY: allocator is retained through the returned lifetime, shape
+        // is valid for the call, and output storage is writable.
+        status_call!(
+            api,
+            CreateSparseTensorAsOrtValue(
+                allocator.as_ptr(),
+                dense_shape.as_ptr(),
+                dense_shape.len(),
+                to_native_element_type(element_type),
+                &mut value,
+            )
+        )?;
+        Ok(Self {
+            environment,
+            value: NonNull::new(require_non_null(value, "sparse tensor value")?)
+                .expect("require_non_null returned a non-null pointer"),
+            _buffer: PhantomData,
+        })
+    }
+
     /// Adopts an owned native value returned by the same environment.
     ///
     /// # Safety
@@ -544,6 +722,15 @@ impl<'buffer> Value<'buffer> {
         // SAFETY: the value is live and output storage is writable.
         status_call!(api, IsTensor(self.as_ptr(), &mut is_tensor))?;
         Ok(is_tensor != 0)
+    }
+
+    /// Returns whether this value is a sparse tensor.
+    pub fn is_sparse_tensor(&self) -> Result<bool> {
+        let api = &self.environment.inner.api;
+        let mut is_sparse = 0;
+        // SAFETY: the value is live and output storage is writable.
+        status_call!(api, IsSparseTensor(self.as_ptr(), &mut is_sparse))?;
+        Ok(is_sparse != 0)
     }
 
     /// Returns the ONNX value category.
@@ -593,23 +780,135 @@ impl<'buffer> Value<'buffer> {
         let info = require_non_null(info, "tensor shape info")?;
         let guard = ShapeInfoGuard { api, info };
 
-        let mut element_type =
-            sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
-        // SAFETY: the shape info is live and output storage is writable.
-        status_call!(api, GetTensorElementType(guard.info, &mut element_type))?;
-        let mut rank = 0;
-        // SAFETY: the shape info is live and output storage is writable.
-        status_call!(api, GetDimensionsCount(guard.info, &mut rank))?;
-        let mut shape = vec![0_i64; rank];
-        // SAFETY: shape has exactly rank writable entries.
+        tensor_info_from_shape(api, guard.info)
+    }
+
+    /// Returns the sparse storage format.
+    pub fn sparse_format(&self) -> Result<SparseFormat> {
+        ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut format = sys::OrtSparseFormat::ORT_SPARSE_UNDEFINED;
+        // SAFETY: the sparse value is live and output storage is writable.
+        status_call!(api, GetSparseTensorFormat(self.as_ptr(), &mut format))?;
+        Ok(format.into())
+    }
+
+    /// Returns the element type and shape of the non-zero values array.
+    pub fn sparse_values_info(&self) -> Result<TensorInfo> {
+        ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut info = ptr::null_mut();
+        // SAFETY: the sparse value is live and output storage is writable.
         status_call!(
             api,
-            GetDimensions(guard.info, shape.as_mut_ptr(), shape.len())
+            GetSparseTensorValuesTypeAndShape(self.as_ptr(), &mut info)
         )?;
-        Ok(TensorInfo {
-            element_type: element_type.into(),
-            shape,
-        })
+        let info = require_non_null(info, "sparse values shape info")?;
+        let guard = ShapeInfoGuard { api, info };
+        tensor_info_from_shape(api, guard.info)
+    }
+
+    /// Borrows sparse non-zero values as a typed slice.
+    ///
+    /// # Safety
+    ///
+    /// The sparse values allocation must be CPU-accessible. ONNX Runtime 1.21
+    /// cannot report `OrtMemoryInfo` for a sparse value, so this cannot be
+    /// checked dynamically.
+    pub unsafe fn sparse_values<T: TensorElement>(&self) -> Result<&[T]> {
+        let info = self.sparse_values_info()?;
+        ensure!(
+            info.element_type == T::ELEMENT_TYPE,
+            ElementTypeMismatchSnafu {
+                expected: T::ELEMENT_TYPE,
+                actual: info.element_type
+            }
+        );
+        let length = element_count(&info.shape)?;
+        let api = &self.environment.inner.api;
+        let mut data = ptr::null();
+        // SAFETY: the sparse value is live and output storage is writable.
+        status_call!(api, GetSparseTensorValues(self.as_ptr(), &mut data))?;
+        if length == 0 {
+            return Ok(&[]);
+        }
+        let data = require_non_null(data.cast_mut().cast::<T>(), "sparse values")?;
+        ensure!(data.align_offset(align_of::<T>()) == 0, MisalignedDataSnafu);
+        // SAFETY: ORT reports the values shape and owns the storage for self's lifetime.
+        Ok(unsafe { slice::from_raw_parts(data, length) })
+    }
+
+    /// Returns metadata for one sparse-index array.
+    pub fn sparse_indices_info(&self, indices: SparseIndices) -> Result<TensorInfo> {
+        ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
+        let api = &self.environment.inner.api;
+        let mut info = ptr::null_mut();
+        // SAFETY: the sparse value is live and output storage is writable.
+        status_call!(
+            api,
+            GetSparseTensorIndicesTypeShape(self.as_ptr(), indices.into(), &mut info)
+        )?;
+        let info = require_non_null(info, "sparse indices shape info")?;
+        let guard = ShapeInfoGuard { api, info };
+        tensor_info_from_shape(api, guard.info)
+    }
+
+    /// Borrows COO indices from CPU-accessible storage.
+    ///
+    /// # Safety
+    ///
+    /// The indices allocation must be CPU-accessible.
+    pub unsafe fn sparse_coo_indices(&self) -> Result<&[i64]> {
+        // SAFETY: delegated to this method's caller.
+        unsafe { self.sparse_indices(SparseIndices::Coo) }
+    }
+
+    /// Borrows CSR inner indices from CPU storage.
+    ///
+    /// # Safety
+    ///
+    /// The indices allocation must be CPU-accessible.
+    pub unsafe fn sparse_csr_inner_indices(&self) -> Result<&[i64]> {
+        // SAFETY: delegated to this method's caller.
+        unsafe { self.sparse_indices(SparseIndices::CsrInner) }
+    }
+
+    /// Borrows CSR outer indices from CPU storage.
+    ///
+    /// # Safety
+    ///
+    /// The indices allocation must be CPU-accessible.
+    pub unsafe fn sparse_csr_outer_indices(&self) -> Result<&[i64]> {
+        // SAFETY: delegated to this method's caller.
+        unsafe { self.sparse_indices(SparseIndices::CsrOuter) }
+    }
+
+    /// Borrows block-sparse indices from CPU storage.
+    ///
+    /// # Safety
+    ///
+    /// The indices allocation must be CPU-accessible.
+    pub unsafe fn sparse_block_indices(&self) -> Result<&[i32]> {
+        // SAFETY: delegated to this method's caller.
+        unsafe { self.sparse_indices(SparseIndices::Block) }
+    }
+
+    unsafe fn sparse_indices<T>(&self, indices: SparseIndices) -> Result<&[T]> {
+        let api = &self.environment.inner.api;
+        let mut length = 0;
+        let mut data = ptr::null();
+        // SAFETY: the sparse value is live and both outputs are writable.
+        status_call!(
+            api,
+            GetSparseTensorIndices(self.as_ptr(), indices.into(), &mut length, &mut data)
+        )?;
+        if length == 0 {
+            return Ok(&[]);
+        }
+        let data = require_non_null(data.cast_mut().cast::<T>(), "sparse indices")?;
+        ensure!(data.align_offset(align_of::<T>()) == 0, MisalignedDataSnafu);
+        // SAFETY: ORT reports length entries owned by self.
+        Ok(unsafe { slice::from_raw_parts(data, length) })
     }
 
     /// Returns a copied snapshot of this tensor's memory descriptor.
@@ -769,6 +1068,76 @@ impl From<sys::ONNXType> for ValueType {
     }
 }
 
+/// Sparse tensor storage format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SparseFormat {
+    /// Sparse format has not been populated yet.
+    Undefined,
+    /// Coordinate-list storage.
+    Coo,
+    /// Compressed sparse row storage.
+    Csr,
+    /// Block-sparse storage.
+    Block,
+    /// A format introduced by a newer runtime.
+    Other(u32),
+}
+
+impl From<sys::OrtSparseFormat> for SparseFormat {
+    fn from(value: sys::OrtSparseFormat) -> Self {
+        match value {
+            sys::OrtSparseFormat::ORT_SPARSE_UNDEFINED => Self::Undefined,
+            sys::OrtSparseFormat::ORT_SPARSE_COO => Self::Coo,
+            sys::OrtSparseFormat::ORT_SPARSE_CSRC => Self::Csr,
+            sys::OrtSparseFormat::ORT_SPARSE_BLOCK_SPARSE => Self::Block,
+            value => Self::Other(value.0),
+        }
+    }
+}
+
+/// One of the index arrays stored by a sparse tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseIndices {
+    /// COO linear or coordinate indices.
+    Coo,
+    /// CSR column indices.
+    CsrInner,
+    /// CSR row offsets.
+    CsrOuter,
+    /// Block-sparse indices.
+    Block,
+}
+
+/// CSR column indices and row offsets supplied together.
+#[derive(Debug, Clone, Copy)]
+pub struct CsrIndices<'a> {
+    /// Column index for every non-zero value.
+    pub inner: &'a [i64],
+    /// Row offsets, normally containing `rows + 1` entries.
+    pub outer: &'a [i64],
+}
+
+/// Shape and values of a block-sparse index tensor.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockSparseIndices<'a> {
+    /// Shape of the indices tensor.
+    pub shape: &'a [i64],
+    /// Flattened block indices.
+    pub values: &'a [i32],
+}
+
+impl From<SparseIndices> for sys::OrtSparseIndicesFormat {
+    fn from(value: SparseIndices) -> Self {
+        match value {
+            SparseIndices::Coo => Self::ORT_SPARSE_COO_INDICES,
+            SparseIndices::CsrInner => Self::ORT_SPARSE_CSR_INNER_INDICES,
+            SparseIndices::CsrOuter => Self::ORT_SPARSE_CSR_OUTER_INDICES,
+            SparseIndices::Block => Self::ORT_SPARSE_BLOCK_SPARSE_INDICES,
+        }
+    }
+}
+
 /// A named borrowed value supplied to [`Session::run_raw`].
 pub struct Input<'value> {
     name: CString,
@@ -804,6 +1173,10 @@ impl<'value> Output<'value> {
     pub fn value_ptr(&self) -> *mut sys::OrtValue {
         self.value.as_ptr()
     }
+
+    pub(super) fn environment(&self) -> &Environment {
+        self.environment
+    }
 }
 
 impl<'value> Input<'value> {
@@ -824,6 +1197,10 @@ impl<'value> Input<'value> {
     /// Returns the borrowed native value pointer.
     pub fn value_ptr(&self) -> *const sys::OrtValue {
         self.value.as_ptr()
+    }
+
+    pub(super) fn environment(&self) -> &Environment {
+        self.environment
     }
 }
 
@@ -1192,6 +1569,25 @@ fn release_values(api: &sys::Api, values: Vec<*mut sys::OrtValue>) {
     }
 }
 
+fn tensor_info_from_shape(
+    api: &sys::Api,
+    info: *const sys::OrtTensorTypeAndShapeInfo,
+) -> Result<TensorInfo> {
+    let mut element_type = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    // SAFETY: shape info is live and output storage is writable.
+    status_call!(api, GetTensorElementType(info, &mut element_type))?;
+    let mut rank = 0;
+    // SAFETY: shape info is live and output storage is writable.
+    status_call!(api, GetDimensionsCount(info, &mut rank))?;
+    let mut shape = vec![0_i64; rank];
+    // SAFETY: shape has exactly rank writable entries.
+    status_call!(api, GetDimensions(info, shape.as_mut_ptr(), shape.len()))?;
+    Ok(TensorInfo {
+        element_type: element_type.into(),
+        shape,
+    })
+}
+
 fn memory_info_name(api: &sys::Api, memory_info: *const sys::OrtMemoryInfo) -> Result<String> {
     let mut name = ptr::null();
     // SAFETY: memory_info is live and output storage is writable. The returned
@@ -1278,6 +1674,33 @@ fn element_count(shape: &[i64]) -> Result<usize> {
                 .checked_mul(dimension)
                 .ok_or(Error::ElementCountOverflow)
         })
+}
+
+fn validate_sparse_source(
+    environment: &Environment,
+    allocator: &Allocator<'_>,
+    source_memory: &MemoryInfo,
+    values_shape: &[i64],
+    values_len: usize,
+) -> Result<()> {
+    ensure!(
+        Environment::same_runtime(environment, &allocator.session.environment)
+            && Environment::same_runtime(environment, &source_memory.environment),
+        ForeignEnvironmentSnafu
+    );
+    ensure!(
+        source_memory.device_type() == DeviceType::Cpu,
+        NonCpuMemorySnafu
+    );
+    let expected = element_count(values_shape)?;
+    ensure!(
+        expected == values_len,
+        ElementCountSnafu {
+            expected,
+            actual: values_len
+        }
+    );
+    Ok(())
 }
 
 fn to_native_element_type(element_type: ElementType) -> sys::ONNXTensorElementDataType {

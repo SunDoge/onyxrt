@@ -1,9 +1,12 @@
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString},
+    future::Future,
     marker::PhantomData,
     path::{Path, PathBuf},
+    pin::Pin,
     ptr,
     sync::Arc,
+    task::{Context, Poll},
 };
 
 use dlpark::versioned;
@@ -52,6 +55,12 @@ pub enum Error {
     #[snafu(display("run options belong to a different ONNX Runtime environment"))]
     ForeignRunOptions,
 
+    #[snafu(display("external initializer belongs to a different ONNX Runtime environment"))]
+    ForeignInitializer,
+
+    #[snafu(display("LoRA adapter belongs to a different ONNX Runtime environment"))]
+    ForeignLoraAdapter,
+
     #[snafu(display("invalid DLPack tensor: {source}"))]
     DlpackTensor { source: dlpark::tensor::Error },
 
@@ -94,6 +103,40 @@ pub struct SessionBuilder {
     pub(super) deterministic_compute: Option<bool>,
     pub(super) config_entries: Vec<(String, String)>,
     pub(super) custom_ops_libraries: Vec<PathBuf>,
+    pub(super) external_data_files: Vec<(String, Vec<u8>)>,
+}
+
+/// A named low-level value supplied while creating a session.
+///
+/// The value only needs to remain live until session creation returns because
+/// ONNX Runtime consumes external initializers while loading the model.
+pub struct ExternalInitializer<'value> {
+    name: CString,
+    value: *const sys::OrtValue,
+    environment: &'value Environment,
+    _borrow: PhantomData<&'value sys::OrtValue>,
+}
+
+impl<'value> ExternalInitializer<'value> {
+    /// Creates a borrowed external initializer without copying tensor storage.
+    pub fn new<'buffer>(name: &str, value: &'value crate::raw::Value<'buffer>) -> Result<Self> {
+        Ok(Self {
+            name: cstring(name, "external initializer")?,
+            value: value.as_ptr(),
+            environment: value.environment(),
+            _borrow: PhantomData,
+        })
+    }
+
+    /// Returns the initializer name.
+    pub fn name(&self) -> &CStr {
+        &self.name
+    }
+
+    /// Returns the borrowed native value pointer.
+    pub fn value_ptr(&self) -> *const sys::OrtValue {
+        self.value
+    }
 }
 
 impl SessionBuilder {
@@ -185,6 +228,20 @@ impl SessionBuilder {
         self
     }
 
+    /// Supplies one external-data file from memory during model loading.
+    ///
+    /// The builder owns the bytes until session creation finishes. `name`
+    /// must match the relative file name stored in the ONNX model.
+    pub fn external_data_file(
+        mut self,
+        name: impl Into<String>,
+        contents: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.external_data_files
+            .push((name.into(), contents.into()));
+        self
+    }
+
     /// Configures the built-in CPU execution provider.
     pub fn cpu_provider(mut self, provider: CpuExecutionProvider) -> Self {
         self.cpu_provider = provider;
@@ -234,9 +291,19 @@ impl SessionBuilder {
     /// The native path API preserves the model directory, allowing ONNX
     /// Runtime to resolve relative external-data tensor files correctly.
     pub fn build_from_file(self, path: impl AsRef<Path>) -> Result<Session> {
+        self.build_from_file_with_external_initializers(path, &[])
+    }
+
+    /// Builds from a model path while supplying its external initializers.
+    pub fn build_from_file_with_external_initializers(
+        self,
+        path: impl AsRef<Path>,
+        initializers: &[ExternalInitializer<'_>],
+    ) -> Result<Session> {
         let path = path.as_ref();
         let native_path = NativeModelPath::new(path)?;
         let options = self.create_options()?;
+        self.apply_external_initializers(options.options, initializers)?;
         let api = &self.environment.inner.api;
         let mut session = ptr::null_mut();
         // SAFETY: env, native_path, and options remain live through the call;
@@ -260,7 +327,17 @@ impl SessionBuilder {
 
     /// Builds a session from an in-memory ONNX model.
     pub fn build_from_bytes(self, model: &[u8]) -> Result<Session> {
+        self.build_from_bytes_with_external_initializers(model, &[])
+    }
+
+    /// Builds from model bytes while supplying its external initializers.
+    pub fn build_from_bytes_with_external_initializers(
+        self,
+        model: &[u8],
+        initializers: &[ExternalInitializer<'_>],
+    ) -> Result<Session> {
         let options = self.create_options()?;
+        self.apply_external_initializers(options.options, initializers)?;
         let api = &self.environment.inner.api;
         let mut session = ptr::null_mut();
         // SAFETY: model and options remain live through the call; env is valid.
@@ -280,6 +357,38 @@ impl SessionBuilder {
             environment: self.environment,
             session: session as usize,
         })
+    }
+
+    fn apply_external_initializers(
+        &self,
+        options: *mut sys::OrtSessionOptions,
+        initializers: &[ExternalInitializer<'_>],
+    ) -> Result<()> {
+        if initializers.is_empty() {
+            return Ok(());
+        }
+        for initializer in initializers {
+            ensure!(
+                Arc::ptr_eq(&self.environment.inner, &initializer.environment.inner),
+                ForeignInitializerSnafu
+            );
+        }
+        let names = initializers
+            .iter()
+            .map(|initializer| initializer.name.as_ptr())
+            .collect::<Vec<_>>();
+        let values = initializers
+            .iter()
+            .map(ExternalInitializer::value_ptr)
+            .collect::<Vec<_>>();
+        let api = &self.environment.inner.api;
+        // SAFETY: arrays have matching lengths and every value, string, and
+        // backing allocation remains live through session creation.
+        status_call!(
+            api,
+            AddExternalInitializers(options, names.as_ptr(), values.as_ptr(), values.len())
+        )?;
+        Ok(())
     }
 
     fn create_options(&self) -> Result<SessionOptionsGuard<'_>> {
@@ -361,6 +470,36 @@ impl SessionBuilder {
             // SAFETY: path uses ORT's native representation and remains live
             // through the synchronous registration call.
             status_call!(api, RegisterCustomOpsLibrary_V2(options, path.as_ptr()))?;
+        }
+        if !self.external_data_files.is_empty() {
+            let names = self
+                .external_data_files
+                .iter()
+                .map(|(name, _)| cstring(name, "external data file name"))
+                .collect::<ffi::Result<Vec<_>>>()?;
+            let name_pointers = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+            let buffers = self
+                .external_data_files
+                .iter()
+                .map(|(_, contents)| contents.as_ptr().cast_mut().cast())
+                .collect::<Vec<*mut std::ffi::c_char>>();
+            let lengths = self
+                .external_data_files
+                .iter()
+                .map(|(_, contents)| contents.len())
+                .collect::<Vec<_>>();
+            // SAFETY: all arrays have matching lengths and the builder retains
+            // every name and byte buffer until session creation completes.
+            status_call!(
+                api,
+                AddExternalInitializersFromFilesInMemory(
+                    options,
+                    name_pointers.as_ptr(),
+                    buffers.as_ptr(),
+                    lengths.as_ptr(),
+                    buffers.len(),
+                )
+            )?;
         }
         if let Some(threads) = self.intra_threads {
             // SAFETY: options remains valid and uniquely borrowed here.
@@ -582,6 +721,83 @@ impl Drop for TensorRtProviderOptionsGuard<'_> {
     }
 }
 
+/// An immutable ONNX Runtime LoRA adapter that can be shared across runs.
+#[derive(Clone)]
+pub struct LoraAdapter {
+    inner: Arc<LoraAdapterInner>,
+}
+
+struct LoraAdapterInner {
+    environment: Environment,
+    adapter: usize,
+}
+
+// SAFETY: adapters are immutable after creation and ORT supports using one
+// adapter from multiple independently configured runs.
+unsafe impl Send for LoraAdapterInner {}
+// SAFETY: the wrapper only exposes shared immutable access to the adapter.
+unsafe impl Sync for LoraAdapterInner {}
+
+impl LoraAdapter {
+    /// Loads an adapter from an ONNX Runtime adapter-format file.
+    pub fn from_file(environment: Environment, path: impl AsRef<Path>) -> Result<Self> {
+        let path = NativeModelPath::new(path.as_ref())?;
+        let api = &environment.inner.api;
+        let mut adapter = ptr::null_mut();
+        // SAFETY: the native path is valid for the call, null selects CPU
+        // storage, and output storage is writable.
+        status_call!(
+            api,
+            CreateLoraAdapter(path.as_ptr(), ptr::null_mut(), &mut adapter)
+        )?;
+        Self::from_created(environment, adapter)
+    }
+
+    /// Copies adapter-format bytes into a new CPU-resident adapter.
+    pub fn from_bytes(environment: Environment, bytes: &[u8]) -> Result<Self> {
+        let api = &environment.inner.api;
+        let mut adapter = ptr::null_mut();
+        // SAFETY: bytes remain live for the synchronous copying constructor,
+        // null selects CPU storage, and output storage is writable.
+        status_call!(
+            api,
+            CreateLoraAdapterFromArray(
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                ptr::null_mut(),
+                &mut adapter,
+            )
+        )?;
+        Self::from_created(environment, adapter)
+    }
+
+    fn from_created(environment: Environment, adapter: *mut sys::OrtLoraAdapter) -> Result<Self> {
+        let adapter = require_non_null(adapter, "LoRA adapter")?;
+        Ok(Self {
+            inner: Arc::new(LoraAdapterInner {
+                environment,
+                adapter: adapter as usize,
+            }),
+        })
+    }
+
+    /// Returns the borrowed native adapter pointer.
+    pub fn as_ptr(&self) -> *const sys::OrtLoraAdapter {
+        self.inner.adapter as *const sys::OrtLoraAdapter
+    }
+}
+
+impl Drop for LoraAdapterInner {
+    fn drop(&mut self) {
+        // SAFETY: the shared inner object uniquely owns the adapter pointer.
+        unsafe {
+            api_function!(self.environment.inner.api, ReleaseLoraAdapter)(
+                self.adapter as *mut sys::OrtLoraAdapter,
+            )
+        };
+    }
+}
+
 /// Reusable options applied to an ONNX Runtime inference run.
 ///
 /// Create this with [`Session::run_options`]. Configuration methods require
@@ -590,6 +806,7 @@ impl Drop for TensorRtProviderOptionsGuard<'_> {
 pub struct RunOptions {
     environment: Environment,
     run_options: usize,
+    lora_adapters: Vec<LoraAdapter>,
 }
 
 // SAFETY: ORT run options may be moved between threads. Configuration requires
@@ -610,6 +827,7 @@ impl RunOptions {
         Ok(Self {
             environment,
             run_options: run_options as usize,
+            lora_adapters: Vec::new(),
         })
     }
 
@@ -658,6 +876,25 @@ impl RunOptions {
         Ok(self)
     }
 
+    /// Activates a LoRA adapter for runs using these options.
+    ///
+    /// This method takes ownership of the adapter handle. Clone the adapter
+    /// explicitly when it must also remain available to other run options.
+    pub fn add_lora_adapter(&mut self, adapter: LoraAdapter) -> Result<&mut Self> {
+        ensure!(
+            Arc::ptr_eq(&self.environment.inner, &adapter.inner.environment.inner),
+            ForeignLoraAdapterSnafu
+        );
+        let api = &self.environment.inner.api;
+        // SAFETY: both objects are live and this RunOptions retains the adapter.
+        status_call!(
+            api,
+            RunOptionsAddActiveLoraAdapter(self.as_mut_ptr(), adapter.as_ptr())
+        )?;
+        self.lora_adapters.push(adapter);
+        Ok(self)
+    }
+
     /// Requests cooperative termination of a run using these options.
     pub fn terminate(&self) -> Result<()> {
         let api = &self.environment.inner.api;
@@ -697,6 +934,92 @@ impl Drop for RunOptions {
     fn drop(&mut self) {
         // SAFETY: this object uniquely owns the live options pointer.
         unsafe { api_function!(self.environment.inner.api, ReleaseRunOptions)(self.as_mut_ptr()) };
+    }
+}
+
+/// Future returned by [`Session::run_values_async`].
+#[must_use = "futures do nothing unless awaited or polled"]
+pub struct ValueRunFuture<'a> {
+    session: &'a Session,
+    environment: Environment,
+    completion: Arc<AsyncCompletion>,
+    names: Vec<String>,
+    _memory_info: MemoryInfoGuard<'a>,
+    _input_values: Vec<ValueGuard<'a>>,
+    run_options: RunOptions,
+    input_name_ptrs: Vec<*const std::ffi::c_char>,
+    input_value_ptrs: Vec<*const sys::OrtValue>,
+    _output_names: Vec<CString>,
+    output_name_ptrs: Vec<*const std::ffi::c_char>,
+    output_slots: Vec<*mut sys::OrtValue>,
+    _input_borrow: PhantomData<&'a [ValueInput<'a>]>,
+    finished: bool,
+}
+
+// SAFETY: the future retains every owned temporary OrtValue and all borrowed
+// DLPack inputs until callback completion. ORT synchronizes the callback.
+unsafe impl Send for ValueRunFuture<'_> {}
+
+impl Future for ValueRunFuture<'_> {
+    type Output = Result<Vec<ValueOutput>>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(!self.finished, "ValueRunFuture polled after completion");
+        let Some(result) = self.completion.poll_result(context.waker()) else {
+            return Poll::Pending;
+        };
+        self.finished = true;
+        Poll::Ready(match result {
+            Ok(values) => self.convert_outputs(values),
+            Err(error) => Err(Error::Ffi {
+                source: Box::new(error),
+            }),
+        })
+    }
+}
+
+impl ValueRunFuture<'_> {
+    /// Requests cooperative cancellation of the native run.
+    pub fn cancel(&self) -> Result<()> {
+        self.run_options.terminate()
+    }
+
+    fn convert_outputs(&mut self, values: Vec<usize>) -> Result<Vec<ValueOutput>> {
+        let api = &self.environment.inner.api;
+        let guards = values
+            .into_iter()
+            .map(|value| ValueGuard::new(api, value as *mut sys::OrtValue))
+            .collect::<Vec<_>>();
+        let mut outputs = Vec::with_capacity(guards.len());
+        for (name, mut guard) in std::mem::take(&mut self.names).into_iter().zip(guards) {
+            let value = guard.ptr;
+            guard.disarm();
+            outputs.push(ValueOutput {
+                name,
+                value: output_to_value(self.environment.clone(), value)?,
+            });
+        }
+        Ok(outputs)
+    }
+}
+
+impl Drop for ValueRunFuture<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = self.run_options.terminate();
+        if let Ok(values) = self.completion.wait_result() {
+            for value in values {
+                // SAFETY: unconsumed callback outputs are uniquely owned here.
+                unsafe {
+                    api_function!(self.session.environment.inner.api, ReleaseValue)(
+                        value as *mut sys::OrtValue,
+                    )
+                };
+            }
+        }
+        self.finished = true;
     }
 }
 
@@ -1022,6 +1345,121 @@ impl Session {
     ) -> Result<Vec<ValueOutput>> {
         options.ensure_session(self)?;
         self.run_values_impl(inputs, output_names, Some(options))
+    }
+
+    /// Submits heterogeneous values to ONNX Runtime's native async API.
+    pub fn run_values_async<'a>(
+        &'a self,
+        inputs: &'a [ValueInput<'a>],
+        output_names: &[&str],
+    ) -> Result<ValueRunFuture<'a>> {
+        let options = self.run_options()?;
+        self.run_values_async_with_options(inputs, output_names, options)
+    }
+
+    /// Submits heterogeneous values asynchronously with owned run options.
+    pub fn run_values_async_with_options<'a>(
+        &'a self,
+        inputs: &'a [ValueInput<'a>],
+        output_names: &[&str],
+        options: RunOptions,
+    ) -> Result<ValueRunFuture<'a>> {
+        options.ensure_session(self)?;
+        let api = &self.environment.inner.api;
+        let mut memory_info = ptr::null_mut();
+        // SAFETY: output storage is writable and enum values are valid.
+        status_call!(
+            api,
+            CreateCpuMemoryInfo(
+                sys::OrtAllocatorType::OrtArenaAllocator,
+                sys::OrtMemType::OrtMemTypeDefault,
+                &mut memory_info,
+            )
+        )?;
+        let memory_info = require_non_null(memory_info, "CPU memory info")?;
+        let memory_guard = MemoryInfoGuard { api, memory_info };
+        let allocator = default_allocator(api)?;
+
+        let mut input_values = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let value = match input {
+                ValueInput::Tensor(input) => {
+                    create_external_tensor(api, memory_info, &input.tensor)?
+                }
+                ValueInput::Strings(input) => create_string_tensor(api, allocator, input)?,
+                ValueInput::Sequence(input) => {
+                    create_sequence_input(api, memory_info, allocator, &input.values)?
+                }
+                ValueInput::Map(input) => {
+                    create_map_input(api, memory_info, allocator, &input.keys, &input.values)?
+                }
+            };
+            input_values.push(ValueGuard::new(api, value));
+        }
+
+        let input_name_ptrs = inputs
+            .iter()
+            .map(|input| input.name().as_ptr())
+            .collect::<Vec<_>>();
+        let input_value_ptrs = input_values
+            .iter()
+            .map(|value| value.ptr.cast_const())
+            .collect::<Vec<_>>();
+        let output_names = output_names
+            .iter()
+            .map(|name| cstring(name, "output").map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let names = output_names
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let output_name_ptrs = output_names
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
+        let output_slots = vec![ptr::null_mut(); output_names.len()];
+        let completion = Arc::new(AsyncCompletion::new(api.clone(), output_names.len()));
+        let mut future = ValueRunFuture {
+            session: self,
+            environment: self.environment.clone(),
+            completion,
+            names,
+            _memory_info: memory_guard,
+            _input_values: input_values,
+            run_options: options,
+            input_name_ptrs,
+            input_value_ptrs,
+            _output_names: output_names,
+            output_name_ptrs,
+            output_slots,
+            _input_borrow: PhantomData,
+            finished: false,
+        };
+
+        let callback_state = Arc::into_raw(future.completion.clone());
+        // SAFETY: all arrays and input values are retained by the future, and
+        // callback_state is reclaimed exactly once by async_run_callback.
+        let status = unsafe {
+            api_function!(api, RunAsync)(
+                self.session as *mut sys::OrtSession,
+                future.run_options.as_ptr(),
+                future.input_name_ptrs.as_ptr(),
+                future.input_value_ptrs.as_ptr(),
+                future.input_value_ptrs.len(),
+                future.output_name_ptrs.as_ptr(),
+                future.output_name_ptrs.len(),
+                future.output_slots.as_mut_ptr(),
+                Some(async_run_callback),
+                callback_state.cast_mut().cast(),
+            )
+        };
+        if !status.is_null() {
+            // SAFETY: failed submission means ORT will not invoke the callback.
+            unsafe { drop(Arc::from_raw(callback_state)) };
+            future.finished = true;
+            check_status(api, status)?;
+        }
+        Ok(future)
     }
 
     fn run_values_impl(

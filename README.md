@@ -117,6 +117,15 @@ allocator so the native allocator cannot be released too early. Memory
 descriptors expose their name, allocator type, device id, memory type, and
 CPU/GPU/FPGA device category.
 
+The raw layer also supports allocator-owned COO, CSR, and block-sparse tensors.
+Sparse metadata is safe to query, but borrowing sparse values or indices as a
+Rust slice is `unsafe`: ONNX Runtime 1.21 does not expose the sparse allocation's
+`OrtMemoryInfo`, so callers must know that the allocator is CPU-accessible.
+
+Existing raw values can be attached to a reusable `IoBinding` with
+`IoBinding::bind_raw`. The returned scoped binding retains input and output
+borrows, synchronizes provider work, and may be executed repeatedly.
+
 For direct extensions, `Environment::raw_api`, `Session::as_ptr`,
 `RunOptions::as_ptr`, `MemoryInfo::as_ptr`, and `Value::{as_ptr, as_mut_ptr,
 into_raw}` expose the underlying handles without transferring ownership unless
@@ -129,14 +138,17 @@ it as an owning DLPack tensor.
 
 ## Asynchronous runs
 
-`Session::run_all_async` and `Session::run_raw_async` wrap ONNX Runtime's
-native callback-based `RunAsync` as Rust futures without requiring Tokio or
-another runtime dependency:
+`Session::run_all_async`, `Session::run_values_async`, and
+`Session::run_raw_async` wrap ONNX Runtime's native callback-based `RunAsync`
+as Rust futures without requiring Tokio or another runtime dependency:
 
 ```rust,ignore
 let outputs = session.run_all_async(&inputs)?.await?;
 let raw_outputs = session.run_raw_async(&raw_inputs, &["output"])?.await?;
 ```
+
+`run_values_async` supports the same numeric, string, sequence, and map values
+as synchronous `run_values`.
 
 ORT schedules this work on its own intra-op thread pool. Dropping an unfinished
 future requests cooperative cancellation and then waits for its native callback
@@ -228,6 +240,18 @@ optimized-model output, deterministic compute, session logging, and arbitrary
 ORT session configuration entries. Custom-op shared libraries can be added with
 `SessionBuilder::custom_ops_library`.
 
+Models using ONNX external data can supply owned in-memory files with
+`SessionBuilder::external_data_file`. To replace named external initializers
+without copying their tensor buffers, construct `session::ExternalInitializer`
+values from `raw::Value` and call
+`build_from_{file,bytes}_with_external_initializers`; the borrows only need to
+remain valid until session creation returns.
+
+LoRA adapters can be loaded with `LoraAdapter::from_file` or
+`LoraAdapter::from_bytes`, then moved into `RunOptions::add_lora_adapter`.
+`LoraAdapter` is cloneable for explicit sharing across multiple run options,
+and each `RunOptions` retains its adapters through every native run.
+
 ## Runtime values
 
 `Session::run_values` accepts heterogeneous `ValueInput` values. Numeric
@@ -244,7 +268,8 @@ let outputs = session.run_values(&inputs, &["output"])?;
 ```
 
 The output `Value` enum also represents sequence, map, and optional values
-recursively. Sparse and opaque values remain explicitly unsupported.
+recursively. Sparse values use the `raw` API described above; opaque values
+remain unsupported by the high-level value enum.
 
 Sequence and map inputs use the same recursive value model. Tensor children
 remain zero-copy DLPack borrows:

@@ -498,6 +498,7 @@ impl Environment {
             deterministic_compute: None,
             config_entries: Vec::new(),
             custom_ops_libraries: Vec::new(),
+            external_data_files: Vec::new(),
         }
     }
 }
