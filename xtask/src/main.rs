@@ -93,8 +93,16 @@ fn generate_bindings(check: bool) -> Result<(), Box<dyn Error>> {
     }
     verify_file_hash(&header, HEADER_SHA256, "vendored ONNX Runtime header")?;
 
+    // ORTCHAR_T is a platform-dependent macro in the upstream header. If
+    // bindgen expands it while running on Linux, path-taking APIs are emitted
+    // permanently as `*const c_char` and fail to compile on Windows. Turn the
+    // two conditional macro definitions into a real typedef so blocklisting
+    // preserves ORTCHAR_T in every function signature.
+    let header_contents = fs::read_to_string(&header)?
+        .replace("#define ORTCHAR_T wchar_t", "typedef wchar_t ORTCHAR_T;")
+        .replace("#define ORTCHAR_T char", "typedef char ORTCHAR_T;");
     let bindings = bindgen::Builder::default()
-        .header(header.to_string_lossy())
+        .header_contents("onnxruntime_c_api.h", &header_contents)
         .clang_arg("-DORT_API_MANUAL_INIT")
         .allowlist_function("OrtGetApiBase")
         .allowlist_type("(ONNX|Ort|GraphOptimizationLevel|ExecutionMode).*")

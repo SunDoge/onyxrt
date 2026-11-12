@@ -765,7 +765,7 @@ pub struct OrtApi {
     pub CreateSession: ::std::option::Option<
         unsafe extern "system" fn(
             env: *const OrtEnv,
-            model_path: *const ::std::os::raw::c_char,
+            model_path: *const ORTCHAR_T,
             options: *const OrtSessionOptions,
             out: *mut *mut OrtSession,
         ) -> OrtStatusPtr,
@@ -843,7 +843,7 @@ pub struct OrtApi {
     pub SetOptimizedModelFilePath: ::std::option::Option<
         unsafe extern "system" fn(
             options: *mut OrtSessionOptions,
-            optimized_model_filepath: *const ::std::os::raw::c_char,
+            optimized_model_filepath: *const ORTCHAR_T,
         ) -> OrtStatusPtr,
     >,
     /** \brief Create a copy of an existing ::OrtSessionOptions
@@ -883,7 +883,7 @@ pub struct OrtApi {
     pub EnableProfiling: ::std::option::Option<
         unsafe extern "system" fn(
             options: *mut OrtSessionOptions,
-            profile_file_prefix: *const ::std::os::raw::c_char,
+            profile_file_prefix: *const ORTCHAR_T,
         ) -> OrtStatusPtr,
     >,
     /** \brief Disable profiling for a session
@@ -2987,7 +2987,7 @@ pub struct OrtApi {
     pub CreateSessionWithPrepackedWeightsContainer: ::std::option::Option<
         unsafe extern "system" fn(
             env: *const OrtEnv,
-            model_path: *const ::std::os::raw::c_char,
+            model_path: *const ORTCHAR_T,
             options: *const OrtSessionOptions,
             prepacked_weights_container: *mut OrtPrepackedWeightsContainer,
             out: *mut *mut OrtSession,
@@ -3952,7 +3952,7 @@ pub struct OrtApi {
     pub RegisterCustomOpsLibrary_V2: ::std::option::Option<
         unsafe extern "system" fn(
             options: *mut OrtSessionOptions,
-            library_name: *const ::std::os::raw::c_char,
+            library_name: *const ORTCHAR_T,
         ) -> OrtStatusPtr,
     >,
     /** \brief Register custom ops by calling a RegisterCustomOpsFn function.
@@ -4339,7 +4339,7 @@ pub struct OrtApi {
             logger: *const OrtLogger,
             log_severity_level: OrtLoggingLevel,
             message: *const ::std::os::raw::c_char,
-            file_path: *const ::std::os::raw::c_char,
+            file_path: *const ORTCHAR_T,
             line_number: ::std::os::raw::c_int,
             func_name: *const ::std::os::raw::c_char,
         ) -> OrtStatusPtr,
@@ -4899,7 +4899,7 @@ pub struct OrtApi {
     pub AddExternalInitializersFromFilesInMemory: ::std::option::Option<
         unsafe extern "system" fn(
             options: *mut OrtSessionOptions,
-            external_initializer_file_names: *const *const ::std::os::raw::c_char,
+            external_initializer_file_names: *const *const ORTCHAR_T,
             external_initializer_file_buffer_array: *const *mut ::std::os::raw::c_char,
             external_initializer_file_lengths: *const usize,
             num_external_initializer_files: usize,
@@ -4924,7 +4924,7 @@ pub struct OrtApi {
     \since Version 1.20.*/
     pub CreateLoraAdapter: ::std::option::Option<
         unsafe extern "system" fn(
-            adapter_file_path: *const ::std::os::raw::c_char,
+            adapter_file_path: *const ORTCHAR_T,
             allocator: *mut OrtAllocator,
             out: *mut *mut OrtLoraAdapter,
         ) -> OrtStatusPtr,
