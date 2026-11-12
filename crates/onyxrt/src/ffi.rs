@@ -219,96 +219,6 @@ pub(super) fn check_status(api: &sys::Api, status: sys::OrtStatusPtr) -> Result<
     Err(Error::Runtime { code, message })
 }
 
-pub(super) trait StatusFunction<Arguments>: Copy {
-    unsafe fn call(self, arguments: Arguments) -> sys::OrtStatusPtr;
-}
-
-impl StatusFunction<()> for unsafe extern "system" fn() -> sys::OrtStatusPtr {
-    unsafe fn call(self, (): ()) -> sys::OrtStatusPtr {
-        // SAFETY: delegated to the caller of StatusFunction::call.
-        unsafe { self() }
-    }
-}
-
-macro_rules! impl_status_function {
-    ($(($type:ident, $value:ident)),+ $(,)?) => {
-        impl<$($type),+> StatusFunction<($($type,)+)>
-            for unsafe extern "system" fn($($type),+) -> sys::OrtStatusPtr
-        {
-            unsafe fn call(self, ($($value,)+): ($($type,)+)) -> sys::OrtStatusPtr {
-                // SAFETY: delegated to the caller of StatusFunction::call.
-                unsafe { self($($value),+) }
-            }
-        }
-    };
-}
-
-impl_status_function!((A0, a0));
-impl_status_function!((A0, a0), (A1, a1));
-impl_status_function!((A0, a0), (A1, a1), (A2, a2));
-impl_status_function!((A0, a0), (A1, a1), (A2, a2), (A3, a3));
-impl_status_function!((A0, a0), (A1, a1), (A2, a2), (A3, a3), (A4, a4));
-impl_status_function!((A0, a0), (A1, a1), (A2, a2), (A3, a3), (A4, a4), (A5, a5));
-impl_status_function!(
-    (A0, a0),
-    (A1, a1),
-    (A2, a2),
-    (A3, a3),
-    (A4, a4),
-    (A5, a5),
-    (A6, a6)
-);
-impl_status_function!(
-    (A0, a0),
-    (A1, a1),
-    (A2, a2),
-    (A3, a3),
-    (A4, a4),
-    (A5, a5),
-    (A6, a6),
-    (A7, a7)
-);
-impl_status_function!(
-    (A0, a0),
-    (A1, a1),
-    (A2, a2),
-    (A3, a3),
-    (A4, a4),
-    (A5, a5),
-    (A6, a6),
-    (A7, a7),
-    (A8, a8)
-);
-impl_status_function!(
-    (A0, a0),
-    (A1, a1),
-    (A2, a2),
-    (A3, a3),
-    (A4, a4),
-    (A5, a5),
-    (A6, a6),
-    (A7, a7),
-    (A8, a8),
-    (A9, a9)
-);
-
-pub(super) unsafe fn call_status<F, Arguments>(
-    api: &sys::Api,
-    function: Option<F>,
-    name: &'static str,
-    arguments: Arguments,
-) -> Result<()>
-where
-    F: StatusFunction<Arguments>,
-{
-    let function = api
-        .function(function, name)
-        .map_err(|source| Error::Api { source })?;
-    // SAFETY: the caller establishes the native function's preconditions.
-    let status = unsafe { function.call(arguments) };
-    check_status(api, status)
-}
-
 macro_rules! api_function {
     ($api:expr, $name:ident) => {{
         ($api)
@@ -319,15 +229,14 @@ macro_rules! api_function {
 
 macro_rules! status_call {
     ($api:expr, $name:ident($($argument:expr),* $(,)?)) => {{
-        // SAFETY: this crate-private macro is used only after each invocation
-        // establishes the C function's preconditions.
-        unsafe {
-            $crate::ffi::call_status(
-                $api,
-                ($api).table().$name,
-                stringify!($name),
-                ($($argument,)*),
-            )
+        match ($api).function(($api).table().$name, stringify!($name)) {
+            Ok(function) => {
+                // SAFETY: this crate-private macro is used only after each
+                // invocation establishes the C function's preconditions.
+                let status = unsafe { function($($argument),*) };
+                $crate::ffi::check_status($api, status)
+            }
+            Err(source) => Err($crate::ffi::Error::Api { source }),
         }
     }};
 }
