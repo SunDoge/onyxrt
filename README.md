@@ -87,7 +87,7 @@ use onyxrt::{
 
 let environment = Environment::builder().build()?;
 let session = environment.session_builder().build_from_file("model.onnx")?;
-let memory = MemoryInfo::cpu(environment.clone())?;
+let memory = MemoryInfo::cpu(&environment)?;
 let mut data = [1.0_f32, 2.0, 3.0];
 let value = ValueMut::tensor(environment, &memory, &mut data, [3])?;
 let inputs = [Input::new("input", &value)?];
@@ -101,6 +101,10 @@ and `ValueMut::allocate_tensor_in` cover provider allocations. Unsafe
 `ValueRef::from_raw_parts` and `ValueMut::from_raw_parts` are available for
 integrations that already manage device memory. COO, CSR, and block-sparse
 borrowed values are also supported.
+
+Enable the `half` feature to use `half::f16` and `half::bf16` with typed tensor
+constructors and `as_slice`/`as_slice_mut`. The `dlpack-half` feature includes
+this automatically.
 
 Use `Session::run_into` for caller-owned preallocated outputs. For repeated
 runs, bind the same values once:
@@ -136,9 +140,9 @@ DLPack is not part of the default feature set:
 onyxrt = { version = "0.1", features = ["dlpack", "dlpack-ndarray"] }
 ```
 
-`dlpack::from_managed` validates and adapts a compact CPU or CUDA tensor without
-a copy. `dlpack::into_managed` transfers an owned ORT output into DLPack without
-a copy:
+`dlpack::from_managed` validates and adapts a compact CPU, CUDA, or ROCm tensor,
+including CUDA/ROCm pinned host memory, without a copy. `dlpack::into_managed`
+transfers an owned ORT output into DLPack without a copy:
 
 ```rust,ignore
 use onyxrt::{dlpack, value::Input};

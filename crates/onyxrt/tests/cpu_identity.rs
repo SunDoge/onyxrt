@@ -1,7 +1,7 @@
 use onyxrt::{
     model::Environment,
     provider::{CudaExecutionProvider, DnnlExecutionProvider, TensorRtExecutionProvider},
-    value::{Input, MemoryInfo, Value, ValueMut},
+    value::{AllocatorType, DeviceType, Input, MemoryInfo, MemoryType, Value, ValueMut},
 };
 
 #[cfg(feature = "dlpack")]
@@ -28,7 +28,32 @@ fn cpu_value_identity_round_trip() {
     let replacement = sessions.build_from_bytes(IDENTITY_MODEL).unwrap();
     assert_eq!(replacement.inputs().unwrap()[0].name(), "x");
 
-    let memory = MemoryInfo::cpu(environment.clone()).unwrap();
+    let memory = MemoryInfo::cpu(&environment).unwrap();
+    let npu_memory = MemoryInfo::new(
+        &environment,
+        "OpenVINO_RT_NPU",
+        AllocatorType::Device,
+        0,
+        MemoryType::Default,
+    )
+    .unwrap();
+    assert_eq!(npu_memory.device_type(), DeviceType::Npu);
+    assert_eq!(
+        MemoryInfo::cuda_pinned(&environment, 0)
+            .unwrap()
+            .device_type(),
+        DeviceType::Gpu
+    );
+    assert_eq!(
+        MemoryInfo::rocm(&environment, 0).unwrap().device_type(),
+        DeviceType::Gpu
+    );
+    assert_eq!(
+        MemoryInfo::rocm_pinned(&environment, 0)
+            .unwrap()
+            .device_type(),
+        DeviceType::Gpu
+    );
     let mut data = [1.5_f32, -2.0, 7.25];
     let value = ValueMut::tensor(environment.clone(), &memory, &mut data, [3]).unwrap();
     let inputs = [Input::new("x", &value).unwrap()];
@@ -40,6 +65,21 @@ fn cpu_value_identity_round_trip() {
 
     let empty = Value::allocate_tensor::<f32>(environment.clone(), [0, 6]).unwrap();
     assert!(empty.as_slice::<f32>().unwrap().is_empty());
+
+    #[cfg(feature = "half")]
+    {
+        let expected = [half::f16::from_f32(1.5), half::f16::from_f32(-2.0)];
+        let mut data = expected;
+        let borrowed = ValueMut::tensor(environment.clone(), &memory, &mut data, [2]).unwrap();
+        assert_eq!(borrowed.as_slice::<half::f16>().unwrap(), &expected);
+
+        let mut owned = Value::allocate_tensor::<half::f16>(environment.clone(), [2]).unwrap();
+        owned
+            .as_slice_mut::<half::f16>()
+            .unwrap()
+            .copy_from_slice(&expected);
+        assert_eq!(owned.as_slice::<half::f16>().unwrap(), &expected);
+    }
 }
 
 #[cfg(feature = "dlpack")]

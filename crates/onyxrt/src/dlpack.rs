@@ -12,7 +12,7 @@ use std::ptr::NonNull;
 
 use crate::{
     model::{ElementType, Environment},
-    value::{self, DeviceType, MemoryInfo, Value, ValueRef},
+    value::{self, DeviceMemoryType, DeviceType, MemoryInfo, MemoryInfoDetails, Value, ValueRef},
 };
 
 /// Result type for DLPack conversion operations.
@@ -85,29 +85,23 @@ pub enum Error {
     Value { source: value::Error },
 }
 
-/// Transfers an owned dense CPU or CUDA ORT tensor into a DLPack handle.
+/// Transfers an owned dense CPU, CUDA, or ROCm ORT tensor into a DLPack handle.
 ///
 /// The returned DLPack deleter owns `value`; dropping the handle releases the
 /// underlying `OrtValue`. Borrowed [`ValueRef`] and [`crate::value::ValueMut`]
 /// values are deliberately not accepted because DLPack may outlive them.
+///
+/// ```compile_fail
+/// use onyxrt::{dlpack, value::ValueRef};
+///
+/// fn transfer(value: ValueRef<'_>) {
+///     let _ = dlpack::into_managed(value);
+/// }
+/// ```
 pub fn into_managed(value: Value) -> Result<versioned::Dlpack> {
     let info = value.tensor_info()?;
     let memory = value.memory_info()?;
-    let device = match (memory.device_type, memory.device_id) {
-        (DeviceType::Cpu, 0) => DLDevice::CPU,
-        (DeviceType::Gpu, device_id)
-            if device_id >= 0 && memory.name.eq_ignore_ascii_case("cuda") =>
-        {
-            DLDevice::cuda(device_id)
-        }
-        (device_type, device_id) => {
-            return Err(Error::UnsupportedOrtDevice {
-                name: memory.name,
-                device_type,
-                device_id,
-            });
-        }
-    };
+    let device = dlpack_device(&memory)?;
     let dtype = dlpack_type(info.element_type)?;
     let data = value.tensor_data_ptr()?;
     let mut initialized = Dynamic::compact(info.shape)
@@ -124,7 +118,49 @@ pub fn into_managed(value: Value) -> Result<versioned::Dlpack> {
     Ok(unsafe { initialized.finish() })
 }
 
-/// Validates and adapts a compact CPU or CUDA DLPack tensor without copying.
+fn dlpack_device(memory: &MemoryInfoDetails) -> Result<DLDevice> {
+    const AMD_VENDOR_ID: u32 = 0x1002;
+    const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+    let device = match (
+        memory.device_type,
+        memory.device_memory_type,
+        memory.vendor_id,
+        memory.device_id,
+    ) {
+        (DeviceType::Gpu, DeviceMemoryType::HostAccessible, NVIDIA_VENDOR_ID, _) => DLDevice {
+            device_type: DLDeviceType::CUDAHOST,
+            device_id: 0,
+        },
+        (DeviceType::Gpu, DeviceMemoryType::HostAccessible, AMD_VENDOR_ID, _) => DLDevice {
+            device_type: DLDeviceType::ROCMHOST,
+            device_id: 0,
+        },
+        (DeviceType::Cpu, _, _, 0) => DLDevice::CPU,
+        (DeviceType::Gpu, DeviceMemoryType::Default, NVIDIA_VENDOR_ID, device_id)
+            if device_id >= 0 =>
+        {
+            DLDevice::cuda(device_id)
+        }
+        (DeviceType::Gpu, DeviceMemoryType::Default, AMD_VENDOR_ID, device_id)
+            if device_id >= 0 =>
+        {
+            DLDevice {
+                device_type: DLDeviceType::ROCM,
+                device_id,
+            }
+        }
+        (device_type, _, _, device_id) => {
+            return Err(Error::UnsupportedOrtDevice {
+                name: memory.name.clone(),
+                device_type,
+                device_id,
+            });
+        }
+    };
+    Ok(device)
+}
+
+/// Validates and adapts a compact CPU, CUDA, or ROCm DLPack tensor without copying.
 pub fn from_managed<'tensor, M>(
     environment: Environment,
     tensor: &'tensor Managed<M>,
@@ -149,10 +185,15 @@ where
     );
     let device = tensor.device();
     let memory_info = match (device.device_type, device.device_id) {
-        (DLDeviceType::CPU, 0) => MemoryInfo::cpu(environment.clone())?,
+        (DLDeviceType::CPU, 0) => MemoryInfo::cpu(&environment)?,
         (DLDeviceType::CUDA, device_id) if device_id >= 0 => {
-            MemoryInfo::cuda(environment.clone(), device_id)?
+            MemoryInfo::cuda(&environment, device_id)?
         }
+        (DLDeviceType::CUDAHOST, 0) => MemoryInfo::cuda_pinned(&environment, 0)?,
+        (DLDeviceType::ROCM, device_id) if device_id >= 0 => {
+            MemoryInfo::rocm(&environment, device_id)?
+        }
+        (DLDeviceType::ROCMHOST, 0) => MemoryInfo::rocm_pinned(&environment, 0)?,
         (device_type, device_id) => {
             return Err(Error::UnsupportedDevice {
                 device_type,
@@ -166,11 +207,12 @@ where
     let data = unsafe { raw_tensor.offset_bytes_ptr() }
         .map_err(|source| Error::InvalidTensor { source })?;
     let element_type = element_type(raw_tensor.dtype())?;
+    let value_environment = environment.clone();
     // SAFETY: data, shape, type, byte length, and device descriptor all
     // come from the validated DLPack tensor retained by this wrapper.
     Ok(unsafe {
         ValueRef::from_raw_parts(
-            environment,
+            value_environment,
             &memory_info,
             NonNull::new(data.cast_mut().cast()).unwrap_or_else(NonNull::dangling),
             raw_tensor.num_bytes(),
@@ -246,4 +288,97 @@ fn dlpack_type(element_type: ElementType) -> Result<DLDataType> {
         }
     };
     Ok(dtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{AllocatorType, MemoryType};
+
+    fn memory(
+        name: &str,
+        device_type: DeviceType,
+        device_memory_type: DeviceMemoryType,
+        vendor_id: u32,
+        device_id: i32,
+    ) -> MemoryInfoDetails {
+        MemoryInfoDetails {
+            name: name.to_owned(),
+            allocator_type: AllocatorType::Device,
+            device_id,
+            vendor_id,
+            memory_type: MemoryType::Default,
+            device_memory_type,
+            device_type,
+        }
+    }
+
+    #[test]
+    fn maps_ort_accelerator_memory_to_dlpack_devices() {
+        for (memory, expected) in [
+            (
+                memory("Cpu", DeviceType::Cpu, DeviceMemoryType::Default, 0, 0),
+                DLDevice::CPU,
+            ),
+            (
+                memory(
+                    "Cuda",
+                    DeviceType::Gpu,
+                    DeviceMemoryType::Default,
+                    0x10DE,
+                    2,
+                ),
+                DLDevice::cuda(2),
+            ),
+            (
+                memory(
+                    "CudaPinned",
+                    DeviceType::Gpu,
+                    DeviceMemoryType::HostAccessible,
+                    0x10DE,
+                    3,
+                ),
+                DLDevice {
+                    device_type: DLDeviceType::CUDAHOST,
+                    device_id: 0,
+                },
+            ),
+            (
+                memory("Hip", DeviceType::Gpu, DeviceMemoryType::Default, 0x1002, 4),
+                DLDevice {
+                    device_type: DLDeviceType::ROCM,
+                    device_id: 4,
+                },
+            ),
+            (
+                memory(
+                    "HipPinned",
+                    DeviceType::Gpu,
+                    DeviceMemoryType::HostAccessible,
+                    0x1002,
+                    5,
+                ),
+                DLDevice {
+                    device_type: DLDeviceType::ROCMHOST,
+                    device_id: 0,
+                },
+            ),
+        ] {
+            assert_eq!(dlpack_device(&memory).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_npu_without_a_provider_specific_dlpack_mapping() {
+        assert!(
+            dlpack_device(&memory(
+                "OpenVINO_RT_NPU",
+                DeviceType::Npu,
+                DeviceMemoryType::Default,
+                0x8086,
+                0,
+            ))
+            .is_err()
+        );
+    }
 }

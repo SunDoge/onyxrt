@@ -1,6 +1,6 @@
 use std::{
     ffi::{CStr, CString, NulError},
-    ptr,
+    ptr::{self, NonNull},
 };
 
 use onyxrt_sys as sys;
@@ -29,13 +29,13 @@ pub(super) enum Error {
     },
 }
 
-pub(super) struct AllocatedBufferGuard<'a> {
+pub(super) struct AllocatedBuffer<'a> {
     pub(super) api: &'a sys::Api,
     pub(super) allocator: *mut sys::OrtAllocator,
     pub(super) allocation: *mut std::ffi::c_void,
 }
 
-impl Drop for AllocatedBufferGuard<'_> {
+impl Drop for AllocatedBuffer<'_> {
     fn drop(&mut self) {
         if self.allocation.is_null() {
             return;
@@ -50,23 +50,43 @@ impl Drop for AllocatedBufferGuard<'_> {
     }
 }
 
-pub(super) struct ShapeInfoGuard<'a> {
-    pub(super) api: &'a sys::Api,
-    pub(super) info: *mut sys::OrtTensorTypeAndShapeInfo,
+pub(super) trait OrtReleasable {
+    unsafe fn release(api: &sys::Api, pointer: *mut Self);
 }
 
-pub(super) struct TypeInfoGuard<'a> {
-    pub(super) api: &'a sys::Api,
-    pub(super) type_info: *mut sys::OrtTypeInfo,
+pub(super) struct OrtOwned<'api, T: OrtReleasable> {
+    api: &'api sys::Api,
+    pointer: NonNull<T>,
 }
 
-pub(super) struct AvailableProvidersGuard<'a> {
+impl<'api, T: OrtReleasable> OrtOwned<'api, T> {
+    pub(super) fn new(api: &'api sys::Api, pointer: *mut T, what: &'static str) -> Result<Self> {
+        Ok(Self {
+            api,
+            pointer: NonNull::new(pointer).ok_or(Error::NullPointer { what })?,
+        })
+    }
+
+    pub(super) fn as_ptr(&self) -> *mut T {
+        self.pointer.as_ptr()
+    }
+}
+
+impl<T: OrtReleasable> Drop for OrtOwned<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: this owner contains the unique non-null pointer returned by
+        // ORT and invokes the release operation paired with its native type.
+        unsafe { T::release(self.api, self.pointer.as_ptr()) };
+    }
+}
+
+pub(super) struct AvailableProviders<'a> {
     pub(super) api: &'a sys::Api,
     pub(super) providers: *mut *mut std::ffi::c_char,
     pub(super) count: i32,
 }
 
-impl Drop for AvailableProvidersGuard<'_> {
+impl Drop for AvailableProviders<'_> {
     fn drop(&mut self) {
         if !self.providers.is_null() {
             discard_provider_array(self.api, self.providers, self.count);
@@ -90,19 +110,30 @@ pub(super) fn discard_provider_array(
     }
 }
 
-impl Drop for TypeInfoGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns a live type-info object.
-        unsafe { api_function!(self.api, ReleaseTypeInfo)(self.type_info) };
-    }
+macro_rules! impl_ort_releasable {
+    ($native:ty, $release:ident) => {
+        impl OrtReleasable for $native {
+            unsafe fn release(api: &sys::Api, pointer: *mut Self) {
+                // SAFETY: OrtOwned guarantees that pointer is the unique live
+                // object returned by this API and calls the paired release once.
+                unsafe { api_function!(api, $release)(pointer) };
+            }
+        }
+    };
 }
 
-impl Drop for ShapeInfoGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns a live shape-info object.
-        unsafe { api_function!(self.api, ReleaseTensorTypeAndShapeInfo)(self.info) };
-    }
-}
+impl_ort_releasable!(
+    sys::OrtTensorTypeAndShapeInfo,
+    ReleaseTensorTypeAndShapeInfo
+);
+impl_ort_releasable!(sys::OrtTypeInfo, ReleaseTypeInfo);
+impl_ort_releasable!(sys::OrtSessionOptions, ReleaseSessionOptions);
+impl_ort_releasable!(sys::OrtCUDAProviderOptionsV2, ReleaseCUDAProviderOptions);
+impl_ort_releasable!(
+    sys::OrtTensorRTProviderOptionsV2,
+    ReleaseTensorRTProviderOptions
+);
+impl_ort_releasable!(sys::OrtDnnlProviderOptions, ReleaseDnnlProviderOptions);
 
 pub(super) fn cstring(value: &str, kind: &'static str) -> Result<CString> {
     CString::new(value).map_err(|source| Error::InvalidName { kind, source })

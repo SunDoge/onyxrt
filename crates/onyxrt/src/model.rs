@@ -10,7 +10,7 @@ use snafu::Snafu;
 
 use crate::{
     ffi::{
-        self, AllocatedBufferGuard, AvailableProvidersGuard, api_function, check_status, cstring,
+        self, AllocatedBuffer, AvailableProviders, api_function, check_status, cstring,
         default_allocator, discard_provider_array, require_const_non_null, require_non_null,
         status_call,
     },
@@ -263,7 +263,7 @@ impl ModelMetadata {
         if value.is_null() {
             return Ok(None);
         }
-        let guard = AllocatedBufferGuard {
+        let guard = AllocatedBuffer {
             api,
             allocator,
             allocation: value.cast(),
@@ -311,7 +311,7 @@ impl ModelMetadata {
         };
         check_status(api, status)?;
         let value = require_non_null(value, "model metadata string")?;
-        let guard = AllocatedBufferGuard {
+        let guard = AllocatedBuffer {
             api,
             allocator,
             allocation: value.cast(),
@@ -443,7 +443,7 @@ impl Environment {
         let mut providers = ptr::null_mut();
         let mut count = 0_i32;
         // SAFETY: both outputs point to writable storage. On success, ownership
-        // of the returned array is transferred to AvailableProvidersGuard.
+        // of the returned array is transferred to AvailableProviders.
         status_call!(api, GetAvailableProviders(&mut providers, &mut count))?;
         if count < 0 {
             if !providers.is_null() {
@@ -453,7 +453,7 @@ impl Environment {
             }
             return Err(Error::InvalidProviderCount { count });
         }
-        let guard = AvailableProvidersGuard {
+        let guard = AvailableProviders {
             api,
             providers,
             count,

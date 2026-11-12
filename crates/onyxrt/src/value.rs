@@ -21,9 +21,7 @@ use onyxrt_sys as sys;
 use snafu::{Snafu, ensure};
 
 use crate::{
-    ffi::{
-        self, ShapeInfoGuard, api_function, check_status, cstring, require_non_null, status_call,
-    },
+    ffi::{self, OrtOwned, api_function, check_status, cstring, require_non_null, status_call},
     io_binding::{AsyncCompletion, async_run_callback},
     model::{ElementType, Environment},
     session::{RunOptions, Session},
@@ -98,22 +96,22 @@ impl From<ffi::Error> for Error {
     }
 }
 
-/// ONNX Runtime memory placement information.
-pub struct MemoryInfo {
-    environment: Environment,
+/// ONNX Runtime memory placement information borrowing its runtime environment.
+pub struct MemoryInfo<'environment> {
+    environment: &'environment Environment,
     memory_info: NonNull<sys::OrtMemoryInfo>,
 }
 
 // SAFETY: OrtMemoryInfo is immutable after construction and contains no Rust
 // references. Its environment retains the originating API table.
-unsafe impl Send for MemoryInfo {}
+unsafe impl Send for MemoryInfo<'_> {}
 // SAFETY: all exposed operations on memory info are read-only.
-unsafe impl Sync for MemoryInfo {}
+unsafe impl Sync for MemoryInfo<'_> {}
 
-impl MemoryInfo {
+impl<'environment> MemoryInfo<'environment> {
     /// Creates a memory descriptor for an execution-provider allocator.
     pub fn new(
-        environment: Environment,
+        environment: &'environment Environment,
         name: &str,
         allocator_type: AllocatorType,
         device_id: i32,
@@ -142,7 +140,7 @@ impl MemoryInfo {
     }
 
     /// Creates the standard CPU arena memory descriptor.
-    pub fn cpu(environment: Environment) -> Result<Self> {
+    pub fn cpu(environment: &'environment Environment) -> Result<Self> {
         let api = &environment.inner.api;
         let mut memory_info = ptr::null_mut();
         // SAFETY: output storage is writable and both enum values are valid.
@@ -162,13 +160,46 @@ impl MemoryInfo {
     }
 
     /// Creates a CUDA device-memory descriptor.
-    pub fn cuda(environment: Environment, device_id: i32) -> Result<Self> {
+    pub fn cuda(environment: &'environment Environment, device_id: i32) -> Result<Self> {
         Self::new(
             environment,
             "Cuda",
             AllocatorType::Device,
             device_id,
             MemoryType::Default,
+        )
+    }
+
+    /// Creates a CUDA page-locked host-memory descriptor.
+    pub fn cuda_pinned(environment: &'environment Environment, device_id: i32) -> Result<Self> {
+        Self::new(
+            environment,
+            "CudaPinned",
+            AllocatorType::Arena,
+            device_id,
+            MemoryType::CpuOutput,
+        )
+    }
+
+    /// Creates a ROCm device-memory descriptor.
+    pub fn rocm(environment: &'environment Environment, device_id: i32) -> Result<Self> {
+        Self::new(
+            environment,
+            "Hip",
+            AllocatorType::Device,
+            device_id,
+            MemoryType::Default,
+        )
+    }
+
+    /// Creates a ROCm page-locked host-memory descriptor.
+    pub fn rocm_pinned(environment: &'environment Environment, device_id: i32) -> Result<Self> {
+        Self::new(
+            environment,
+            "HipPinned",
+            AllocatorType::Arena,
+            device_id,
+            MemoryType::CpuOutput,
         )
     }
 
@@ -204,6 +235,16 @@ impl MemoryInfo {
         memory_info_memory_type(&self.environment.inner.api, self.as_ptr())
     }
 
+    /// Returns the PCI vendor identifier, or zero for a generic device.
+    pub fn vendor_id(&self) -> u32 {
+        memory_info_vendor_id(&self.environment.inner.api, self.as_ptr())
+    }
+
+    /// Returns whether the allocation is device-local or host-accessible.
+    pub fn device_memory_type(&self) -> DeviceMemoryType {
+        memory_info_device_memory_type(&self.environment.inner.api, self.as_ptr())
+    }
+
     /// Returns the broad device category.
     pub fn device_type(&self) -> DeviceType {
         memory_info_device_type(&self.environment.inner.api, self.as_ptr())
@@ -217,7 +258,7 @@ impl MemoryInfo {
     /// Compares two descriptors using ONNX Runtime's native semantics.
     pub fn is_equal(&self, other: &Self) -> Result<bool> {
         ensure!(
-            Environment::same_runtime(&self.environment, &other.environment),
+            Environment::same_runtime(self.environment, other.environment),
             ForeignEnvironmentSnafu
         );
         let api = &self.environment.inner.api;
@@ -231,7 +272,7 @@ impl MemoryInfo {
     }
 }
 
-impl Drop for MemoryInfo {
+impl Drop for MemoryInfo<'_> {
     fn drop(&mut self) {
         // SAFETY: this wrapper uniquely owns the live memory-info object.
         unsafe {
@@ -304,6 +345,18 @@ pub enum MemoryType {
     Default,
 }
 
+/// Device-local versus host-accessible allocation memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeviceMemoryType {
+    /// Memory local to the device.
+    Default,
+    /// Pinned or shared memory accessible by both the host and device.
+    HostAccessible,
+    /// A device memory category introduced by a newer runtime.
+    Unknown(u32),
+}
+
 impl From<MemoryType> for sys::OrtMemType {
     fn from(value: MemoryType) -> Self {
         match value {
@@ -324,6 +377,8 @@ pub enum DeviceType {
     Gpu,
     /// FPGA memory.
     Fpga,
+    /// Neural processing unit memory.
+    Npu,
     /// A device category introduced by a newer runtime.
     Unknown(u32),
 }
@@ -337,8 +392,12 @@ pub struct MemoryInfoDetails {
     pub allocator_type: AllocatorType,
     /// Execution-provider device identifier.
     pub device_id: i32,
+    /// PCI vendor identifier, or zero for a generic device.
+    pub vendor_id: u32,
     /// Execution-provider memory usage.
     pub memory_type: MemoryType,
+    /// Device-local or host-accessible memory category.
+    pub device_memory_type: DeviceMemoryType,
     /// Broad device category.
     pub device_type: DeviceType,
 }
@@ -373,6 +432,12 @@ tensor_elements! {
     u64 => Uint64,
 }
 
+#[cfg(feature = "half")]
+tensor_elements! {
+    half::f16 => Float16,
+    half::bf16 => BFloat16,
+}
+
 mod private {
     pub trait Sealed {}
 }
@@ -395,6 +460,16 @@ pub struct Value {
 unsafe impl Send for Value {}
 
 /// An `OrtValue` that read-only borrows externally managed tensor storage.
+///
+/// Shared views cannot expose mutable tensor storage:
+///
+/// ```compile_fail
+/// use onyxrt::value::ValueRef;
+///
+/// fn mutate(value: &mut ValueRef<'_>) {
+///     let _ = value.as_slice_mut::<f32>();
+/// }
+/// ```
 pub struct ValueRef<'buffer> {
     inner: ValueMut<'buffer>,
     _buffer: PhantomData<&'buffer [u8]>,
@@ -408,12 +483,12 @@ impl<'buffer> ValueMut<'buffer> {
     /// Creates a tensor backed directly by a mutable Rust slice.
     pub fn tensor<T: TensorElement>(
         environment: Environment,
-        memory_info: &MemoryInfo,
+        memory_info: &MemoryInfo<'_>,
         data: &'buffer mut [T],
         shape: impl AsRef<[i64]>,
     ) -> Result<Self> {
         ensure!(
-            Environment::same_runtime(&environment, &memory_info.environment),
+            Environment::same_runtime(&environment, memory_info.environment),
             ForeignEnvironmentSnafu
         );
         ensure!(
@@ -456,7 +531,7 @@ impl<'buffer> ValueMut<'buffer> {
     /// must accurately describe the storage.
     pub unsafe fn from_raw_parts(
         environment: Environment,
-        memory_info: &MemoryInfo,
+        memory_info: &MemoryInfo<'_>,
         data: NonNull<c_void>,
         byte_len: usize,
         shape: &[i64],
@@ -526,7 +601,7 @@ impl<'buffer> ValueMut<'buffer> {
     pub fn sparse_coo<T: TensorElement>(
         environment: Environment,
         allocator: &'buffer Allocator<'_>,
-        source_memory: &MemoryInfo,
+        source_memory: &MemoryInfo<'_>,
         dense_shape: impl AsRef<[i64]>,
         values_shape: impl AsRef<[i64]>,
         values: &[T],
@@ -569,7 +644,7 @@ impl<'buffer> ValueMut<'buffer> {
     pub fn sparse_csr<T: TensorElement>(
         environment: Environment,
         allocator: &'buffer Allocator<'_>,
-        source_memory: &MemoryInfo,
+        source_memory: &MemoryInfo<'_>,
         dense_shape: impl AsRef<[i64]>,
         values_shape: impl AsRef<[i64]>,
         values: &[T],
@@ -613,7 +688,7 @@ impl<'buffer> ValueMut<'buffer> {
     pub fn sparse_block<T: TensorElement>(
         environment: Environment,
         allocator: &'buffer Allocator<'_>,
-        source_memory: &MemoryInfo,
+        source_memory: &MemoryInfo<'_>,
         dense_shape: impl AsRef<[i64]>,
         values_shape: impl AsRef<[i64]>,
         values: &[T],
@@ -779,10 +854,8 @@ impl<'buffer> ValueMut<'buffer> {
         let mut info = ptr::null_mut();
         // SAFETY: the value is a live tensor and output storage is writable.
         status_call!(api, GetTensorTypeAndShape(self.as_ptr(), &mut info))?;
-        let info = require_non_null(info, "tensor shape info")?;
-        let guard = ShapeInfoGuard { api, info };
-
-        tensor_info_from_shape(api, guard.info)
+        let info = OrtOwned::new(api, info, "tensor shape info")?;
+        tensor_info_from_shape(api, info.as_ptr())
     }
 
     /// Returns the sparse storage format.
@@ -805,9 +878,8 @@ impl<'buffer> ValueMut<'buffer> {
             api,
             GetSparseTensorValuesTypeAndShape(self.as_ptr(), &mut info)
         )?;
-        let info = require_non_null(info, "sparse values shape info")?;
-        let guard = ShapeInfoGuard { api, info };
-        tensor_info_from_shape(api, guard.info)
+        let info = OrtOwned::new(api, info, "sparse values shape info")?;
+        tensor_info_from_shape(api, info.as_ptr())
     }
 
     /// Borrows sparse non-zero values as a typed slice.
@@ -850,9 +922,8 @@ impl<'buffer> ValueMut<'buffer> {
             api,
             GetSparseTensorIndicesTypeShape(self.as_ptr(), indices.into(), &mut info)
         )?;
-        let info = require_non_null(info, "sparse indices shape info")?;
-        let guard = ShapeInfoGuard { api, info };
-        tensor_info_from_shape(api, guard.info)
+        let info = OrtOwned::new(api, info, "sparse indices shape info")?;
+        tensor_info_from_shape(api, info.as_ptr())
     }
 
     /// Borrows COO indices from CPU-accessible storage.
@@ -1010,7 +1081,7 @@ impl<'buffer> ValueRef<'buffer> {
     /// describe the storage. The storage need not be writable.
     pub unsafe fn from_raw_parts(
         environment: Environment,
-        memory_info: &MemoryInfo,
+        memory_info: &MemoryInfo<'_>,
         data: NonNull<c_void>,
         byte_len: usize,
         shape: &[i64],
@@ -1035,14 +1106,14 @@ impl<'buffer> ValueRef<'buffer> {
 
 unsafe fn create_external_value<'buffer>(
     environment: Environment,
-    memory_info: &MemoryInfo,
+    memory_info: &MemoryInfo<'_>,
     data: NonNull<c_void>,
     byte_len: usize,
     shape: &[i64],
     element_type: ElementType,
 ) -> Result<ValueMut<'buffer>> {
     ensure!(
-        Environment::same_runtime(&environment, &memory_info.environment),
+        Environment::same_runtime(&environment, memory_info.environment),
         ForeignEnvironmentSnafu
     );
     let api = &memory_info.environment.inner.api;
@@ -1379,10 +1450,10 @@ impl Session {
     /// Creates a session allocator for the requested memory location.
     pub fn allocator<'session>(
         &'session self,
-        memory_info: &MemoryInfo,
+        memory_info: &MemoryInfo<'_>,
     ) -> Result<Allocator<'session>> {
         ensure!(
-            Environment::same_runtime(&self.environment, &memory_info.environment),
+            Environment::same_runtime(&self.environment, memory_info.environment),
             ForeignEnvironmentSnafu
         );
         let api = &self.environment.inner.api;
@@ -1807,7 +1878,28 @@ fn memory_info_device_type(api: &sys::Api, memory_info: *const sys::OrtMemoryInf
         sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU => DeviceType::Cpu,
         sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_GPU => DeviceType::Gpu,
         sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_FPGA => DeviceType::Fpga,
+        sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_NPU => DeviceType::Npu,
         value => DeviceType::Unknown(value.0),
+    }
+}
+
+fn memory_info_vendor_id(api: &sys::Api, memory_info: *const sys::OrtMemoryInfo) -> u32 {
+    // SAFETY: memory_info is a live descriptor and the getter returns a scalar.
+    unsafe { api_function!(api, MemoryInfoGetVendorId)(memory_info) }
+}
+
+fn memory_info_device_memory_type(
+    api: &sys::Api,
+    memory_info: *const sys::OrtMemoryInfo,
+) -> DeviceMemoryType {
+    // SAFETY: memory_info is a live descriptor and the getter returns a scalar.
+    let memory_type = unsafe { api_function!(api, MemoryInfoGetDeviceMemType)(memory_info) };
+    match memory_type {
+        sys::OrtDeviceMemoryType::OrtDeviceMemoryType_DEFAULT => DeviceMemoryType::Default,
+        sys::OrtDeviceMemoryType::OrtDeviceMemoryType_HOST_ACCESSIBLE => {
+            DeviceMemoryType::HostAccessible
+        }
+        value => DeviceMemoryType::Unknown(value.0),
     }
 }
 
@@ -1819,7 +1911,9 @@ fn memory_info_details(
         name: memory_info_name(api, memory_info)?,
         allocator_type: memory_info_allocator_type(api, memory_info)?,
         device_id: memory_info_device_id(api, memory_info)?,
+        vendor_id: memory_info_vendor_id(api, memory_info),
         memory_type: memory_info_memory_type(api, memory_info)?,
+        device_memory_type: memory_info_device_memory_type(api, memory_info),
         device_type: memory_info_device_type(api, memory_info),
     })
 }
@@ -1841,13 +1935,13 @@ fn element_count(shape: &[i64]) -> Result<usize> {
 fn validate_sparse_source(
     environment: &Environment,
     allocator: &Allocator<'_>,
-    source_memory: &MemoryInfo,
+    source_memory: &MemoryInfo<'_>,
     values_shape: &[i64],
     values_len: usize,
 ) -> Result<()> {
     ensure!(
         Environment::same_runtime(environment, &allocator.session.environment)
-            && Environment::same_runtime(environment, &source_memory.environment),
+            && Environment::same_runtime(environment, source_memory.environment),
         ForeignEnvironmentSnafu
     );
     ensure!(
@@ -1895,5 +1989,17 @@ fn to_native_element_type(element_type: ElementType) -> sys::ONNXTensorElementDa
         ElementType::Uint2 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
         ElementType::Int2 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
         ElementType::Float8E8M0 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
+    }
+}
+
+#[cfg(all(test, feature = "half"))]
+mod tests {
+    use super::TensorElement;
+    use crate::model::ElementType;
+
+    #[test]
+    fn half_types_have_onnx_element_types() {
+        assert_eq!(half::f16::ELEMENT_TYPE, ElementType::Float16);
+        assert_eq!(half::bf16::ELEMENT_TYPE, ElementType::BFloat16);
     }
 }

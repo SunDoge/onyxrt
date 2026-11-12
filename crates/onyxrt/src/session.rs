@@ -11,8 +11,8 @@ use snafu::{Snafu, ensure};
 
 use crate::{
     ffi::{
-        self, AllocatedBufferGuard, TypeInfoGuard, api_function, check_status, cstring,
-        default_allocator, require_const_non_null, require_non_null, status_call,
+        self, AllocatedBuffer, OrtOwned, api_function, check_status, cstring, default_allocator,
+        require_const_non_null, require_non_null, status_call,
     },
     io_binding::IoBinding,
     model::{
@@ -259,7 +259,7 @@ impl SessionBuilder {
         let path = path.as_ref();
         let native_path = NativeModelPath::new(path)?;
         let options = self.create_options()?;
-        self.apply_external_initializers(options.options, initializers)?;
+        self.apply_external_initializers(options.as_ptr(), initializers)?;
         let api = &self.environment.inner.api;
         let mut session = ptr::null_mut();
         // SAFETY: env, native_path, and options remain live through the call;
@@ -268,7 +268,7 @@ impl SessionBuilder {
             api_function!(api, CreateSession)(
                 self.environment.inner.env as *const sys::OrtEnv,
                 native_path.as_ptr(),
-                options.options,
+                options.as_ptr(),
                 &mut session,
             )
         };
@@ -293,7 +293,7 @@ impl SessionBuilder {
         initializers: &[ExternalInitializer<'_>],
     ) -> Result<Session> {
         let options = self.create_options()?;
-        self.apply_external_initializers(options.options, initializers)?;
+        self.apply_external_initializers(options.as_ptr(), initializers)?;
         let api = &self.environment.inner.api;
         let mut session = ptr::null_mut();
         // SAFETY: model and options remain live through the call; env is valid.
@@ -302,7 +302,7 @@ impl SessionBuilder {
                 self.environment.inner.env as *const sys::OrtEnv,
                 model.as_ptr().cast(),
                 model.len(),
-                options.options,
+                options.as_ptr(),
                 &mut session,
             )
         };
@@ -347,13 +347,13 @@ impl SessionBuilder {
         Ok(())
     }
 
-    fn create_options(&self) -> Result<SessionOptionsGuard<'_>> {
+    fn create_options(&self) -> Result<OrtOwned<'_, sys::OrtSessionOptions>> {
         let api = &self.environment.inner.api;
         let mut options = ptr::null_mut();
         // SAFETY: output points to writable storage.
         status_call!(api, CreateSessionOptions(&mut options))?;
-        let options = require_non_null(options, "session options")?;
-        let guard = SessionOptionsGuard { api, options };
+        let guard = OrtOwned::new(api, options, "session options")?;
+        let options = guard.as_ptr();
 
         // SAFETY: options is a live, uniquely configured options object.
         status_call!(
@@ -495,8 +495,8 @@ pub(super) fn append_cuda_provider(
     let mut options = ptr::null_mut();
     // SAFETY: output points to writable storage owned by the guard below.
     status_call!(api, CreateCUDAProviderOptions(&mut options))?;
-    let options = require_non_null(options, "CUDA provider options")?;
-    let guard = CudaProviderOptionsGuard { api, options };
+    let guard = OrtOwned::new(api, options, "CUDA provider options")?;
+    let options = guard.as_ptr();
     if encoded.len() != 0 {
         // SAFETY: the key/value pointer arrays have matching lengths and all
         // C strings remain live through the synchronous call.
@@ -528,8 +528,8 @@ pub(super) fn append_tensorrt_provider(
     let mut options = ptr::null_mut();
     // SAFETY: output points to writable storage owned by the guard below.
     status_call!(api, CreateTensorRTProviderOptions(&mut options))?;
-    let options = require_non_null(options, "TensorRT provider options")?;
-    let guard = TensorRtProviderOptionsGuard { api, options };
+    let guard = OrtOwned::new(api, options, "TensorRT provider options")?;
+    let options = guard.as_ptr();
     if encoded.len() != 0 {
         // SAFETY: the key/value pointer arrays have matching lengths and all
         // C strings remain live through the synchronous call.
@@ -581,8 +581,8 @@ pub(super) fn append_dnnl_provider(
     let mut options = ptr::null_mut();
     // SAFETY: output points to writable storage owned by the guard below.
     status_call!(api, CreateDnnlProviderOptions(&mut options))?;
-    let options = require_non_null(options, "oneDNN provider options")?;
-    let guard = DnnlProviderOptionsGuard { api, options };
+    let guard = OrtOwned::new(api, options, "oneDNN provider options")?;
+    let options = guard.as_ptr();
     if encoded.len() != 0 {
         // SAFETY: the key/value pointer arrays have matching lengths and all
         // C strings remain live through the synchronous call.
@@ -625,56 +625,6 @@ pub(super) fn append_named_provider(
         )
     )?;
     Ok(())
-}
-
-pub(super) struct SessionOptionsGuard<'a> {
-    api: &'a sys::Api,
-    options: *mut sys::OrtSessionOptions,
-}
-
-impl Drop for SessionOptionsGuard<'_> {
-    fn drop(&mut self) {
-        if !self.options.is_null() {
-            // SAFETY: this guard uniquely owns the options pointer.
-            unsafe { api_function!(self.api, ReleaseSessionOptions)(self.options) };
-        }
-    }
-}
-
-pub(super) struct CudaProviderOptionsGuard<'a> {
-    api: &'a sys::Api,
-    options: *mut sys::OrtCUDAProviderOptionsV2,
-}
-
-impl Drop for CudaProviderOptionsGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns the options pointer.
-        unsafe { api_function!(self.api, ReleaseCUDAProviderOptions)(self.options) };
-    }
-}
-
-pub(super) struct TensorRtProviderOptionsGuard<'a> {
-    api: &'a sys::Api,
-    options: *mut sys::OrtTensorRTProviderOptionsV2,
-}
-
-pub(super) struct DnnlProviderOptionsGuard<'a> {
-    api: &'a sys::Api,
-    options: *mut sys::OrtDnnlProviderOptions,
-}
-
-impl Drop for DnnlProviderOptionsGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns the options pointer.
-        unsafe { api_function!(self.api, ReleaseDnnlProviderOptions)(self.options) };
-    }
-}
-
-impl Drop for TensorRtProviderOptionsGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns the options pointer.
-        unsafe { api_function!(self.api, ReleaseTensorRTProviderOptions)(self.options) };
-    }
 }
 
 /// An immutable ONNX Runtime LoRA adapter that can be shared across runs.
@@ -1006,7 +956,7 @@ impl Session {
             SessionEndProfiling(self.session as *mut sys::OrtSession, allocator, &mut path,)
         )?;
         let path = require_non_null(path, "profile output path")?;
-        let guard = AllocatedBufferGuard {
+        let guard = AllocatedBuffer {
             api,
             allocator,
             allocation: path.cast(),
@@ -1123,9 +1073,8 @@ impl Session {
                 }
             };
         check_status(api, status)?;
-        let type_info = require_non_null(type_info, "model value type info")?;
-        let _type_guard = TypeInfoGuard { api, type_info };
-        let value_type = read_value_type(api, type_info)?;
+        let type_info = OrtOwned::new(api, type_info, "model value type info")?;
+        let value_type = read_value_type(api, type_info.as_ptr())?;
 
         Ok(ValueInfo { name, value_type })
     }
@@ -1166,12 +1115,9 @@ pub(super) fn read_value_type(
             let mut element = ptr::null_mut();
             // SAFETY: sequence_info is live and element is writable output.
             status_call!(api, GetSequenceElementType(sequence_info, &mut element))?;
-            let element = require_non_null(element, "sequence element type info")?;
-            let _guard = TypeInfoGuard {
-                api,
-                type_info: element,
-            };
-            read_value_type(api, element).map(|element| ValueTypeInfo::Sequence(Box::new(element)))
+            let element = OrtOwned::new(api, element, "sequence element type info")?;
+            read_value_type(api, element.as_ptr())
+                .map(|element| ValueTypeInfo::Sequence(Box::new(element)))
         }
         sys::ONNXType::ONNX_TYPE_MAP => {
             let mut map_info = ptr::null();
@@ -1185,14 +1131,10 @@ pub(super) fn read_value_type(
             let mut value = ptr::null_mut();
             // SAFETY: map_info is live and value is writable output.
             status_call!(api, GetMapValueType(map_info, &mut value))?;
-            let value = require_non_null(value, "map value type info")?;
-            let _guard = TypeInfoGuard {
-                api,
-                type_info: value,
-            };
+            let value = OrtOwned::new(api, value, "map value type info")?;
             Ok(ValueTypeInfo::Map {
                 key: key.into(),
-                value: Box::new(read_value_type(api, value)?),
+                value: Box::new(read_value_type(api, value.as_ptr())?),
             })
         }
         sys::ONNXType::ONNX_TYPE_OPTIONAL => {
@@ -1210,12 +1152,8 @@ pub(super) fn read_value_type(
                 api,
                 GetOptionalContainedTypeInfo(optional_info, &mut contained)
             )?;
-            let contained = require_non_null(contained, "optional contained type info")?;
-            let _guard = TypeInfoGuard {
-                api,
-                type_info: contained,
-            };
-            read_value_type(api, contained)
+            let contained = OrtOwned::new(api, contained, "optional contained type info")?;
+            read_value_type(api, contained.as_ptr())
                 .map(|contained| ValueTypeInfo::Optional(Box::new(contained)))
         }
         sys::ONNXType::ONNX_TYPE_SPARSETENSOR => Ok(ValueTypeInfo::SparseTensor),

@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add accessors for runtime tensor element types and shapes
 - add zero-copy conversion from owned ORT tensors into DLPack
+- add typed `half::f16` and `half::bf16` tensor support behind the `half`
+  feature
+- add NPU memory classification and CUDA/ROCm device and pinned-host DLPack
+  mappings
 
 ### Fixed
 
@@ -20,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - split values into owned `Value`, read-only borrowed `ValueRef`, and writable
   borrowed `ValueMut`
+- make `MemoryInfo` borrow its environment instead of retaining an `Arc` clone
+- consolidate simple native cleanup guards into one typed `OrtOwned` owner
 - update the runtime baseline to ONNX Runtime 1.31.1 / C API v31
 
 ## [0.1.1](https://github.com/SunDoge/onyxrt/releases/tag/onyxrt-v0.1.1) - 2026-11-12
