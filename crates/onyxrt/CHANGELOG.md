@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   borrowed `ValueMut`
 - make `MemoryInfo` borrow its environment instead of retaining an `Arc` clone
 - consolidate simple native cleanup guards into one typed `OrtOwned` owner
+- make `ValueRef` the read-only value interface instead of wrapping and
+  dereferencing to `ValueMut`
 - update the runtime baseline to ONNX Runtime 1.31.1 / C API v31
 
 ## [0.1.1](https://github.com/SunDoge/onyxrt/releases/tag/onyxrt-v0.1.1) - 2026-11-12

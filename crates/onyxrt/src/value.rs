@@ -442,22 +442,10 @@ mod private {
     pub trait Sealed {}
 }
 
-/// An `OrtValue` whose writable storage or allocator is borrowed.
-pub struct ValueMut<'buffer> {
+struct ValueInner {
     environment: Environment,
     value: NonNull<sys::OrtValue>,
-    _buffer: PhantomData<&'buffer mut [u8]>,
 }
-
-/// An `OrtValue` that owns its storage and has no external lifetime dependency.
-pub struct Value {
-    inner: ValueMut<'static>,
-}
-
-// SAFETY: an owned value has no borrowed allocator or storage. Moving its
-// unique handle to another thread does not create concurrent access, and ORT
-// permits values to be released from a thread other than the creating thread.
-unsafe impl Send for Value {}
 
 /// An `OrtValue` that read-only borrows externally managed tensor storage.
 ///
@@ -471,13 +459,32 @@ unsafe impl Send for Value {}
 /// }
 /// ```
 pub struct ValueRef<'buffer> {
-    inner: ValueMut<'buffer>,
+    inner: ValueInner,
     _buffer: PhantomData<&'buffer [u8]>,
 }
 
+/// An `OrtValue` whose writable storage or allocator is borrowed.
+///
+/// This layers exclusive access over [`ValueRef`]'s read-only interface;
+/// mutable tensor access is defined only on this type.
+pub struct ValueMut<'buffer> {
+    inner: ValueRef<'buffer>,
+    _buffer: PhantomData<&'buffer mut [u8]>,
+}
+
+/// An `OrtValue` that owns its storage and has no external lifetime dependency.
+pub struct Value {
+    inner: ValueMut<'static>,
+}
+
+// SAFETY: an owned value has no borrowed allocator or storage. Moving its
+// unique handle to another thread does not create concurrent access, and ORT
+// permits values to be released from a thread other than the creating thread.
+unsafe impl Send for Value {}
+
 impl<'buffer> ValueMut<'buffer> {
     pub(super) fn environment(&self) -> &Environment {
-        &self.environment
+        &self.inner.inner.environment
     }
 
     /// Creates a tensor backed directly by a mutable Rust slice.
@@ -538,7 +545,7 @@ impl<'buffer> ValueMut<'buffer> {
         element_type: ElementType,
     ) -> Result<Self> {
         // SAFETY: forwarded directly from this function's safety contract.
-        unsafe {
+        Ok(Self::from_inner(unsafe {
             create_external_value(
                 environment,
                 memory_info,
@@ -546,8 +553,8 @@ impl<'buffer> ValueMut<'buffer> {
                 byte_len,
                 shape,
                 element_type,
-            )
-        }
+            )?
+        }))
     }
 
     /// Allocates a tensor from a session allocator.
@@ -589,12 +596,11 @@ impl<'buffer> ValueMut<'buffer> {
                 &mut value,
             )
         )?;
-        Ok(Self {
+        Ok(Self::from_inner(ValueInner {
             environment,
             value: NonNull::new(require_non_null(value, "allocated tensor value")?)
                 .expect("require_non_null returned a non-null pointer"),
-            _buffer: PhantomData,
-        })
+        }))
     }
 
     /// Creates an allocator-owned COO sparse tensor by copying CPU slices.
@@ -622,7 +628,7 @@ impl<'buffer> ValueMut<'buffer> {
             T::ELEMENT_TYPE,
         )?;
         let value_ptr = value.as_mut_ptr();
-        let api = &value.environment.inner.api;
+        let api = &value.environment().inner.api;
         // SAFETY: source slices and descriptor are CPU-resident and live for
         // this copying call; value is an empty allocator-owned sparse tensor.
         status_call!(
@@ -665,7 +671,7 @@ impl<'buffer> ValueMut<'buffer> {
             T::ELEMENT_TYPE,
         )?;
         let value_ptr = value.as_mut_ptr();
-        let api = &value.environment.inner.api;
+        let api = &value.environment().inner.api;
         // SAFETY: all source slices are CPU-resident and copied synchronously.
         status_call!(
             api,
@@ -717,7 +723,7 @@ impl<'buffer> ValueMut<'buffer> {
             T::ELEMENT_TYPE,
         )?;
         let value_ptr = value.as_mut_ptr();
-        let api = &value.environment.inner.api;
+        let api = &value.environment().inner.api;
         // SAFETY: all source slices are CPU-resident and copied synchronously.
         status_call!(
             api,
@@ -760,12 +766,11 @@ impl<'buffer> ValueMut<'buffer> {
                 &mut value,
             )
         )?;
-        Ok(Self {
+        Ok(Self::from_inner(ValueInner {
             environment,
             value: NonNull::new(require_non_null(value, "sparse tensor value")?)
                 .expect("require_non_null returned a non-null pointer"),
-            _buffer: PhantomData,
-        })
+        }))
     }
 
     /// Adopts an owned native value returned by the same environment.
@@ -775,26 +780,50 @@ impl<'buffer> ValueMut<'buffer> {
     /// `value` must be a uniquely owned live `OrtValue` created by
     /// `environment`. Ownership is transferred to the returned wrapper.
     unsafe fn from_raw_owned(environment: Environment, value: NonNull<sys::OrtValue>) -> Self {
+        Self::from_inner(ValueInner { environment, value })
+    }
+
+    fn from_inner(inner: ValueInner) -> Self {
         Self {
-            environment,
-            value,
+            inner: ValueRef {
+                inner,
+                _buffer: PhantomData,
+            },
             _buffer: PhantomData,
         }
     }
 
-    /// Returns the native value pointer for read-only FFI calls.
-    pub fn as_ptr(&self) -> *const sys::OrtValue {
-        self.value.as_ptr()
-    }
-
     /// Returns the native value pointer for calls that may mutate the value.
     pub fn as_mut_ptr(&mut self) -> *mut sys::OrtValue {
-        self.value.as_ptr()
+        self.inner.inner.value.as_ptr()
+    }
+
+    /// Exclusively borrows CPU tensor storage as a typed mutable slice.
+    pub fn as_slice_mut<T: TensorElement>(&mut self) -> Result<&mut [T]> {
+        let (pointer, length) = self.typed_data::<T>()?;
+        // SAFETY: &mut self ensures exclusive access for the returned borrow.
+        Ok(unsafe { slice::from_raw_parts_mut(pointer, length) })
+    }
+
+    /// Releases Rust ownership of the native descriptor and returns its pointer.
+    pub fn into_raw(self) -> *mut sys::OrtValue {
+        self.inner.inner.into_raw()
+    }
+}
+
+impl<'buffer> ValueRef<'buffer> {
+    pub(super) fn environment(&self) -> &Environment {
+        &self.inner.environment
+    }
+
+    /// Returns the native value pointer for read-only FFI calls.
+    pub fn as_ptr(&self) -> *const sys::OrtValue {
+        self.inner.value.as_ptr()
     }
 
     /// Returns whether this value is a dense tensor.
     pub fn is_tensor(&self) -> Result<bool> {
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut is_tensor = 0;
         // SAFETY: the value is live and output storage is writable.
         status_call!(api, IsTensor(self.as_ptr(), &mut is_tensor))?;
@@ -803,7 +832,7 @@ impl<'buffer> ValueMut<'buffer> {
 
     /// Returns whether this value is a sparse tensor.
     pub fn is_sparse_tensor(&self) -> Result<bool> {
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut is_sparse = 0;
         // SAFETY: the value is live and output storage is writable.
         status_call!(api, IsSparseTensor(self.as_ptr(), &mut is_sparse))?;
@@ -812,7 +841,7 @@ impl<'buffer> ValueMut<'buffer> {
 
     /// Returns the ONNX value category.
     pub fn value_type(&self) -> Result<ValueType> {
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut value_type = sys::ONNXType::ONNX_TYPE_UNKNOWN;
         // SAFETY: the value is live and output storage is writable.
         status_call!(api, GetValueType(self.as_ptr(), &mut value_type))?;
@@ -821,7 +850,7 @@ impl<'buffer> ValueMut<'buffer> {
 
     /// Returns the child count of a sequence, map, or optional value.
     pub fn value_count(&self) -> Result<usize> {
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut count = 0;
         // SAFETY: the value is live and output storage is writable. ORT
         // validates that this value category supports child access.
@@ -835,7 +864,7 @@ impl<'buffer> ValueMut<'buffer> {
     /// returned value, so the child does not borrow its parent.
     pub fn value_at(&self, index: usize) -> Result<Value> {
         let index = i32::try_from(index).map_err(|_| Error::ContainerIndexOverflow { index })?;
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let allocator = ffi::default_allocator(api)?;
         let mut value = ptr::null_mut();
         // SAFETY: the parent and allocator are live and output storage is
@@ -844,13 +873,13 @@ impl<'buffer> ValueMut<'buffer> {
         let value = NonNull::new(require_non_null(value, "container child value")?)
             .expect("require_non_null returned a non-null pointer");
         // SAFETY: GetValue transfers unique ownership of the copied child.
-        Ok(unsafe { Value::from_raw_owned(self.environment.clone(), value) })
+        Ok(unsafe { Value::from_raw_owned(self.inner.environment.clone(), value) })
     }
 
     /// Returns the tensor element type and shape.
     pub fn tensor_info(&self) -> Result<TensorInfo> {
         ensure!(self.is_tensor()?, NotTensorSnafu);
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut info = ptr::null_mut();
         // SAFETY: the value is a live tensor and output storage is writable.
         status_call!(api, GetTensorTypeAndShape(self.as_ptr(), &mut info))?;
@@ -861,7 +890,7 @@ impl<'buffer> ValueMut<'buffer> {
     /// Returns the sparse storage format.
     pub fn sparse_format(&self) -> Result<SparseFormat> {
         ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut format = sys::OrtSparseFormat::ORT_SPARSE_UNDEFINED;
         // SAFETY: the sparse value is live and output storage is writable.
         status_call!(api, GetSparseTensorFormat(self.as_ptr(), &mut format))?;
@@ -871,7 +900,7 @@ impl<'buffer> ValueMut<'buffer> {
     /// Returns the element type and shape of the non-zero values array.
     pub fn sparse_values_info(&self) -> Result<TensorInfo> {
         ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut info = ptr::null_mut();
         // SAFETY: the sparse value is live and output storage is writable.
         status_call!(
@@ -899,7 +928,7 @@ impl<'buffer> ValueMut<'buffer> {
             }
         );
         let length = element_count(&info.shape)?;
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut data = ptr::null();
         // SAFETY: the sparse value is live and output storage is writable.
         status_call!(api, GetSparseTensorValues(self.as_ptr(), &mut data))?;
@@ -915,7 +944,7 @@ impl<'buffer> ValueMut<'buffer> {
     /// Returns metadata for one sparse-index array.
     pub fn sparse_indices_info(&self, indices: SparseIndices) -> Result<TensorInfo> {
         ensure!(self.is_sparse_tensor()?, NotSparseTensorSnafu);
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut info = ptr::null_mut();
         // SAFETY: the sparse value is live and output storage is writable.
         status_call!(
@@ -967,7 +996,7 @@ impl<'buffer> ValueMut<'buffer> {
     }
 
     unsafe fn sparse_indices<T>(&self, indices: SparseIndices) -> Result<&[T]> {
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut length = 0;
         let mut data = ptr::null();
         // SAFETY: the sparse value is live and both outputs are writable.
@@ -987,7 +1016,7 @@ impl<'buffer> ValueMut<'buffer> {
     /// Returns a copied snapshot of this tensor's memory descriptor.
     pub fn memory_info(&self) -> Result<MemoryInfoDetails> {
         ensure!(self.is_tensor()?, NotTensorSnafu);
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut memory_info = ptr::null();
         // SAFETY: the value is live and output storage is writable.
         status_call!(api, GetTensorMemoryInfo(self.as_ptr(), &mut memory_info))?;
@@ -1001,13 +1030,6 @@ impl<'buffer> ValueMut<'buffer> {
         // SAFETY: typed_data validated CPU placement, type, alignment, and
         // element count. The borrow is tied to this live value.
         Ok(unsafe { slice::from_raw_parts(pointer.cast_const(), length) })
-    }
-
-    /// Exclusively borrows CPU tensor storage as a typed mutable slice.
-    pub fn as_slice_mut<T: TensorElement>(&mut self) -> Result<&mut [T]> {
-        let (pointer, length) = self.typed_data::<T>()?;
-        // SAFETY: &mut self ensures exclusive access for the returned borrow.
-        Ok(unsafe { slice::from_raw_parts_mut(pointer, length) })
     }
 
     fn typed_data<T: TensorElement>(&self) -> Result<(*mut T, usize)> {
@@ -1028,9 +1050,12 @@ impl<'buffer> ValueMut<'buffer> {
             return Ok((NonNull::<T>::dangling().as_ptr(), 0));
         }
         let mut data = ptr::null_mut();
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         // SAFETY: the value is a dense tensor and output storage is writable.
-        status_call!(api, GetTensorMutableData(self.value.as_ptr(), &mut data))?;
+        status_call!(
+            api,
+            GetTensorMutableData(self.inner.value.as_ptr(), &mut data)
+        )?;
         let data = require_non_null(data.cast::<T>(), "tensor data")?;
         ensure!(data.align_offset(align_of::<T>()) == 0, MisalignedDataSnafu);
         Ok((data, length))
@@ -1043,15 +1068,18 @@ impl<'buffer> ValueMut<'buffer> {
             return Ok(ptr::null_mut());
         }
         let mut data = ptr::null_mut();
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         // SAFETY: tensor_info established that this is a dense tensor and the
         // output pointer storage is writable. The pointer is not dereferenced.
-        status_call!(api, GetTensorMutableData(self.value.as_ptr(), &mut data))?;
+        status_call!(
+            api,
+            GetTensorMutableData(self.inner.value.as_ptr(), &mut data)
+        )?;
         Ok(require_non_null(data, "tensor data")?)
     }
 
     fn is_cpu_tensor(&self) -> Result<bool> {
-        let api = &self.environment.inner.api;
+        let api = &self.inner.environment.inner.api;
         let mut memory_info = ptr::null();
         // SAFETY: the value is live and output storage is writable.
         status_call!(api, GetTensorMemoryInfo(self.as_ptr(), &mut memory_info))?;
@@ -1062,15 +1090,6 @@ impl<'buffer> ValueMut<'buffer> {
         Ok(device_type == sys::OrtMemoryInfoDeviceType::OrtMemoryInfoDeviceType_CPU)
     }
 
-    /// Releases Rust ownership and returns the native pointer.
-    pub fn into_raw(self) -> *mut sys::OrtValue {
-        let pointer = self.value.as_ptr();
-        std::mem::forget(self);
-        pointer
-    }
-}
-
-impl<'buffer> ValueRef<'buffer> {
     /// Creates a read-only tensor view over arbitrary external storage.
     ///
     /// # Safety
@@ -1104,14 +1123,14 @@ impl<'buffer> ValueRef<'buffer> {
     }
 }
 
-unsafe fn create_external_value<'buffer>(
+unsafe fn create_external_value(
     environment: Environment,
     memory_info: &MemoryInfo<'_>,
     data: NonNull<c_void>,
     byte_len: usize,
     shape: &[i64],
     element_type: ElementType,
-) -> Result<ValueMut<'buffer>> {
+) -> Result<ValueInner> {
     ensure!(
         Environment::same_runtime(&environment, memory_info.environment),
         ForeignEnvironmentSnafu
@@ -1132,11 +1151,10 @@ unsafe fn create_external_value<'buffer>(
             &mut value,
         )
     )?;
-    Ok(ValueMut {
+    Ok(ValueInner {
         environment,
         value: NonNull::new(require_non_null(value, "tensor value")?)
             .expect("require_non_null returned a non-null pointer"),
-        _buffer: PhantomData,
     })
 }
 
@@ -1232,15 +1250,29 @@ impl DerefMut for Value {
     }
 }
 
-impl<'buffer> Deref for ValueRef<'buffer> {
-    type Target = ValueMut<'buffer>;
+impl<'buffer> Deref for ValueMut<'buffer> {
+    type Target = ValueRef<'buffer>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl Drop for ValueMut<'_> {
+impl DerefMut for ValueMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl ValueInner {
+    fn into_raw(self) -> *mut sys::OrtValue {
+        let pointer = self.value.as_ptr();
+        std::mem::forget(self);
+        pointer
+    }
+}
+
+impl Drop for ValueInner {
     fn drop(&mut self) {
         // SAFETY: this wrapper uniquely owns the live OrtValue.
         unsafe { api_function!(self.environment.inner.api, ReleaseValue)(self.value.as_ptr()) };
@@ -1395,8 +1427,8 @@ impl<'value> Output<'value> {
     pub fn new<'buffer>(name: &str, value: &'value mut ValueMut<'buffer>) -> Result<Self> {
         Ok(Self {
             name: cstring(name, "output")?,
-            value: value.value,
-            environment: &value.environment,
+            value: value.inner.inner.value,
+            environment: value.environment(),
             _borrow: PhantomData,
         })
     }
@@ -1418,11 +1450,11 @@ impl<'value> Output<'value> {
 
 impl<'value> Input<'value> {
     /// Creates a named input without copying its value.
-    pub fn new<'buffer>(name: &str, value: &'value ValueMut<'buffer>) -> Result<Self> {
+    pub fn new<'buffer>(name: &str, value: &'value ValueRef<'buffer>) -> Result<Self> {
         Ok(Self {
             name: cstring(name, "input")?,
-            value: value.value,
-            environment: &value.environment,
+            value: value.inner.value,
+            environment: value.environment(),
         })
     }
 

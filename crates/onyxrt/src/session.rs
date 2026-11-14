@@ -103,7 +103,7 @@ impl<'value> ExternalInitializer<'value> {
     /// Creates a borrowed external initializer without copying tensor storage.
     pub fn new<'buffer>(
         name: &str,
-        value: &'value crate::value::ValueMut<'buffer>,
+        value: &'value crate::value::ValueRef<'buffer>,
     ) -> Result<Self> {
         Ok(Self {
             name: cstring(name, "external initializer")?,
