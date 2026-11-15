@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/SunDoge/onyxrt/compare/onyxrt-v0.2.0...onyxrt-v0.3.0) - 2026-11-15
+
+### Fixed
+
+- eliminate denied Cargo warnings
+
+### Other
+
+- separate read-only value interface
+
 ## [0.2.0](https://github.com/SunDoge/onyxrt/compare/onyxrt-v0.1.1...onyxrt-v0.2.0) - 2026-11-12
 
 ### Added
