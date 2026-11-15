@@ -23,6 +23,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
+          # Semver checks build the immutable crates.io baseline as well as the
+          # current workspace. Do not turn warnings from an older published
+          # manifest into errors; the regular CI workflow remains warning-free.
+          build-warnings: ""
       - name: Publish with release-plz
         uses: release-plz/action@v0.5
         with:
@@ -51,6 +55,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
+          # See the release job above: cargo-semver-checks must be able to
+          # document historical packages that can no longer be edited.
+          build-warnings: ""
       - name: Create or update release PR
         uses: release-plz/action@v0.5
         with:
