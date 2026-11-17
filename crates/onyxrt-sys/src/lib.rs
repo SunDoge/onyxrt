@@ -258,8 +258,8 @@ fn default_library_names() -> Vec<OsString> {
         vec![
             OsString::from("libonnxruntime.so"),
             OsString::from("libonnxruntime.so.1"),
-            OsString::from("libonnxruntime.so.1.31"),
-            OsString::from("libonnxruntime.so.1.31.1"),
+            OsString::from("libonnxruntime.so.1.32"),
+            OsString::from("libonnxruntime.so.1.32.0"),
         ]
     }
 }

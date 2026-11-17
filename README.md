@@ -4,7 +4,7 @@ Safe Rust bindings for the ONNX Runtime C API. The runtime is loaded dynamically
 so applications can use an official ONNX Runtime release or a library shipped in
 a Python wheel without compiling ONNX Runtime themselves.
 
-The workspace targets ONNX Runtime C API v31 (ONNX Runtime 1.31 or newer):
+The workspace targets ONNX Runtime C API v32 (ONNX Runtime 1.32 or newer):
 
 - `onyxrt-sys` contains the generated ABI definitions and dynamic loader.
 - `onyxrt` provides environments, reusable session configuration, execution

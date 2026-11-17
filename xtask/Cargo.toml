@@ -8,8 +8,8 @@ publish = false
 
 [dependencies]
 bindgen = "=0.73.2"
-reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = "0.10.9"
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 usage-rs = "7.3.0"
 
 [lints]

@@ -8,13 +8,13 @@ use std::{
 use sha2::{Digest, Sha256};
 use usage_rs::{Args, Cli, Subcommands};
 
-const ORT_VERSION: &str = "1.31.1";
-const HEADER_URL: &str = "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.31.1/include/onnxruntime/core/session/onnxruntime_c_api.h";
-const HEADER_BASE_URL: &str = "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.31.1/include/onnxruntime/core/session";
+const ORT_VERSION: &str = "1.32.0";
+const HEADER_URL: &str = "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.32.0/include/onnxruntime/core/session/onnxruntime_c_api.h";
+const HEADER_BASE_URL: &str = "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.32.0/include/onnxruntime/core/session";
 const HEADERS: &[(&str, &str)] = &[
     (
         "onnxruntime_c_api.h",
-        "43d584f596ef66820421317df32a79a95fc1d39ee46cb3971a870c08d8ba4baa",
+        "4a8df643e1667147db6a9de16570aac452cc17fb2423984530c964363d6ff5f8",
     ),
     (
         "onnxruntime_error_code.h",
@@ -22,7 +22,7 @@ const HEADERS: &[(&str, &str)] = &[
     ),
     (
         "onnxruntime_ep_c_api.h",
-        "b64036772115dbc6f06a900487ce22d34e862100db03e2ad62210758e27a19b2",
+        "7ca769301114baeb8cb7e0aed901b44a0b3726079fd908daada68fb47bd33bb2",
     ),
 ];
 
@@ -66,15 +66,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn download_header(check: bool) -> Result<(), Box<dyn Error>> {
-    let client = reqwest::blocking::Client::builder()
+    let client: ureq::Agent = ureq::Agent::config_builder()
         .user_agent(concat!("onyxrt-xtask/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+        .build()
+        .into();
     for &(name, expected_hash) in HEADERS {
-        let contents = client
-            .get(format!("{HEADER_BASE_URL}/{name}"))
-            .send()?
-            .error_for_status()?
-            .bytes()?;
+        let mut response = client.get(format!("{HEADER_BASE_URL}/{name}")).call()?;
+        let contents = response.body_mut().read_to_vec()?;
         let actual_hash = format!("{:x}", Sha256::digest(&contents));
         if actual_hash != expected_hash {
             return Err(format!(
