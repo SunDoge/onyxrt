@@ -15,7 +15,7 @@ jobs:
       run:
         working-directory: onyxrt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: onyxrt
       - uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -40,7 +40,7 @@ jobs:
       run:
         working-directory: onyxrt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: onyxrt
       - uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -58,7 +58,7 @@ jobs:
       run:
         working-directory: onyxrt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: onyxrt
       - uses: actions-rust-lang/setup-rust-toolchain@v2
