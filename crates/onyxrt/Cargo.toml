@@ -16,7 +16,7 @@ include = ["src/**", "tests/**", "CHANGELOG.md", "../../README.md", "LICENSE-MIT
 dlpark = { workspace = true, optional = true }
 half = { workspace = true, optional = true }
 snafu.workspace = true
-onyxrt-sys = { path = "../onyxrt-sys", version = "0.4.0" }
+onyxrt-sys = { path = "../onyxrt-sys", version = "0.5.0" }
 
 [features]
 default = []
