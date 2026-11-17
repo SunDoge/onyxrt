@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 bindgen = "=0.73.2"
-sha2 = "0.10.9"
+sha2 = "0.11.1"
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 usage-rs = "7.3.0"
 

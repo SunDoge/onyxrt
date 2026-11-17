@@ -73,7 +73,7 @@ fn download_header(check: bool) -> Result<(), Box<dyn Error>> {
     for &(name, expected_hash) in HEADERS {
         let mut response = client.get(format!("{HEADER_BASE_URL}/{name}")).call()?;
         let contents = response.body_mut().read_to_vec()?;
-        let actual_hash = format!("{:x}", Sha256::digest(&contents));
+        let actual_hash = sha256_hex(&contents);
         if actual_hash != expected_hash {
             return Err(format!(
                 "downloaded ONNX Runtime v{ORT_VERSION} {name} has SHA-256 {actual_hash}; expected {expected_hash}"
@@ -208,7 +208,7 @@ fn format_rust_source(source: &str) -> Result<String, Box<dyn Error>> {
 
 fn verify_file_hash(path: &Path, expected: &str, description: &str) -> Result<(), Box<dyn Error>> {
     let contents = fs::read(path)?;
-    let actual = format!("{:x}", Sha256::digest(contents));
+    let actual = sha256_hex(contents);
     if actual != expected {
         return Err(format!(
             "{description} at {} has SHA-256 {actual}; expected {expected}; run `cargo xtask download-header`",
@@ -217,6 +217,18 @@ fn verify_file_hash(path: &Path, expected: &str, description: &str) -> Result<()
         .into());
     }
     Ok(())
+}
+
+fn sha256_hex(contents: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = Sha256::digest(contents.as_ref());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
 }
 
 fn check_contents(path: &Path, expected: &[u8], description: &str) -> Result<(), Box<dyn Error>> {
