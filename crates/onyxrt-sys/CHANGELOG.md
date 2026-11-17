@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/SunDoge/onyxrt/compare/onyxrt-sys-v0.3.0...onyxrt-sys-v0.4.0) - 2026-11-17
+
+### Added
+
+- [**breaking**] update ONNX Runtime bindings to 1.32
+
 ## [0.3.0](https://github.com/SunDoge/onyxrt/compare/onyxrt-sys-v0.2.0...onyxrt-sys-v0.3.0) - 2026-11-15
 
 ### Fixed
