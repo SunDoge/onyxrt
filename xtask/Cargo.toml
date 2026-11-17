@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 bindgen = "=0.73.2"
-reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = "0.10.9"
 usage-rs = "7.3.0"
 
