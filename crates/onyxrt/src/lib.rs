@@ -3,6 +3,8 @@
 //! The [`value`] module is the core value and inference API. Optional DLPack
 //! interoperability is available through the `dlpack` feature.
 
+pub mod compile;
+pub mod device;
 #[cfg(feature = "dlpack")]
 pub mod dlpack;
 pub mod io_binding;

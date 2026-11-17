@@ -1,4 +1,5 @@
 use onyxrt::{
+    device::{DeviceMemoryType, HardwareDeviceType},
     model::Environment,
     provider::{CudaExecutionProvider, DnnlExecutionProvider, TensorRtExecutionProvider},
     value::{AllocatorType, DeviceType, Input, MemoryInfo, MemoryType, Value, ValueMut},
@@ -23,6 +24,38 @@ const IDENTITY_MODEL: &[u8] = &[
 #[ignore = "requires an ONNX Runtime native library; see README"]
 fn cpu_value_identity_round_trip() {
     let environment = test_environment();
+    let devices = environment.ep_devices().unwrap();
+    let cpu = devices
+        .iter()
+        .find(|device| device.provider_name().unwrap() == "CPUExecutionProvider")
+        .unwrap();
+    assert_eq!(cpu.hardware_type().unwrap(), HardwareDeviceType::Cpu);
+    assert!(!cpu.provider_vendor().unwrap().is_empty());
+    assert!(!cpu.hardware_vendor().unwrap().is_empty());
+    let _ = cpu.vendor_id().unwrap();
+    let _ = cpu.device_id().unwrap();
+    // CPU builds may report ORT_NOT_IMPLEMENTED, but this still exercises the
+    // v32 capacity-query ABI and its status handling.
+    let _ = cpu.total_memory_capacity(DeviceMemoryType::Default);
+
+    assert!(
+        environment
+            .session_builder()
+            .config(
+                "session.use_external_initializer_file_buffers_directly",
+                "1"
+            )
+            .is_err()
+    );
+    assert!(
+        environment
+            .session_builder()
+            .config(
+                "session.use_external_initializer_file_buffers_directly",
+                "0"
+            )
+            .is_ok()
+    );
     let sessions = environment.session_builder();
     let first = sessions.build_from_bytes(IDENTITY_MODEL).unwrap();
     let replacement = sessions.build_from_bytes(IDENTITY_MODEL).unwrap();
@@ -80,6 +113,19 @@ fn cpu_value_identity_round_trip() {
             .copy_from_slice(&expected);
         assert_eq!(owned.as_slice::<half::f16>().unwrap(), &expected);
     }
+}
+
+#[test]
+#[ignore = "requires an ONNX Runtime native library; see README"]
+fn cpu_compiles_model_to_memory() {
+    let environment = test_environment();
+    let sessions = environment.session_builder();
+    let compiled = sessions.compiler().compile_bytes(IDENTITY_MODEL).unwrap();
+    assert!(!compiled.is_empty());
+    sessions
+        .weightless_source_model(IDENTITY_MODEL)
+        .build_from_bytes(&compiled)
+        .unwrap();
 }
 
 #[cfg(feature = "dlpack")]

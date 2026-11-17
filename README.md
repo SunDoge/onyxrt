@@ -70,7 +70,30 @@ resolution for external-data models. Use `build_from_bytes` for in-memory
 models. The builder also supports owned external-data files, external
 initializers, custom-op libraries, LoRA adapters, profiling, optimized-model
 output, memory-pattern control, deterministic compute, and arbitrary session
-configuration entries.
+configuration entries that do not extend borrowed initializer lifetimes.
+
+## Devices and model compilation
+
+ONNX Runtime 1.32 execution-provider devices can be inspected before creating a
+session. Providers that implement the query also expose total and currently
+available device memory through `EpDevice::memory_capacity`.
+
+Providers with EPContext compilation support can reuse a session configuration:
+
+```rust,no_run
+use onyxrt::compile::WeightlessMode;
+
+# fn example(environment: &onyxrt::model::Environment, model: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+let sessions = environment.session_builder();
+let compiled = sessions
+    .compiler()
+    .weightless_mode(WeightlessMode::Disabled)
+    .compile_bytes(model)?;
+let session = sessions.build_from_bytes(&compiled)?;
+# let _ = session;
+# Ok(())
+# }
+```
 
 ## Values and inference
 

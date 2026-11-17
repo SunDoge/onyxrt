@@ -247,10 +247,10 @@ fn element_type(dtype: DLDataType) -> Result<ElementType> {
         (DLDataTypeCode::FLOAT8_E5M2FNUZ, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ,
         (DLDataTypeCode::UINT, 4) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4,
         (DLDataTypeCode::INT, 4) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
-        (DLDataTypeCode::FLOAT4_E2M1FN, 4) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
-        (DLDataTypeCode::UINT, 2) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
-        (DLDataTypeCode::INT, 2) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
-        (DLDataTypeCode::FLOAT8_E8M0FNU, 8) => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
+        (DLDataTypeCode::FLOAT4_E2M1FN, 4) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
+        (DLDataTypeCode::UINT, 2) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
+        (DLDataTypeCode::INT, 2) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
+        (DLDataTypeCode::FLOAT8_E8M0FNU, 8) => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
         _ => return Err(Error::UnsupportedType { dtype }),
     };
     Ok(value.into())
@@ -283,7 +283,10 @@ fn dlpack_type(element_type: ElementType) -> Result<DLDataType> {
         ElementType::Uint2 => DLDataType::scalar(DLDataTypeCode::UINT, 2),
         ElementType::Int2 => DLDataType::scalar(DLDataTypeCode::INT, 2),
         ElementType::Float8E8M0 => DLDataType::F8E8M0FNU,
-        ElementType::Undefined | ElementType::String => {
+        ElementType::Undefined
+        | ElementType::String
+        | ElementType::Float6E2M3
+        | ElementType::Float6E3M2 => {
             return Err(Error::UnsupportedElementType { element_type });
         }
     };

@@ -2017,10 +2017,12 @@ fn to_native_element_type(element_type: ElementType) -> sys::ONNXTensorElementDa
         ElementType::Float8E5M2Fnuz => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ,
         ElementType::Uint4 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4,
         ElementType::Int4 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
-        ElementType::Float4E2M1 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
-        ElementType::Uint2 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
-        ElementType::Int2 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
-        ElementType::Float8E8M0 => sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
+        ElementType::Float4E2M1 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1,
+        ElementType::Uint2 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2,
+        ElementType::Int2 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2,
+        ElementType::Float8E8M0 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0,
+        ElementType::Float6E2M3 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT6E2M3,
+        ElementType::Float6E3M2 => O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT6E3M2,
     }
 }
 

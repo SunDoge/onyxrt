@@ -9,6 +9,7 @@ use onyxrt_sys as sys;
 use snafu::Snafu;
 
 use crate::{
+    device::{self, EpDevice},
     ffi::{
         self, AllocatedBuffer, AvailableProviders, api_function, check_status, cstring,
         default_allocator, discard_provider_array, require_const_non_null, require_non_null,
@@ -101,6 +102,10 @@ pub enum ElementType {
     Int2,
     /// Float8 E8M0.
     Float8E8M0,
+    /// Float6 E2M3, stored as one byte per element in an ORT tensor.
+    Float6E2M3,
+    /// Float6 E3M2, stored as one byte per element in an ORT tensor.
+    Float6E3M2,
 }
 
 impl From<sys::ONNXTensorElementDataType> for ElementType {
@@ -130,12 +135,32 @@ impl From<sys::ONNXTensorElementDataType> for ElementType {
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ => Self::Float8E5M2Fnuz,
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4 => Self::Uint4,
             O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4 => Self::Int4,
-            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1 => Self::Float4E2M1,
-            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2 => Self::Uint2,
-            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 => Self::Int2,
-            sys::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0 => Self::Float8E8M0,
+            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1 => Self::Float4E2M1,
+            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2 => Self::Uint2,
+            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 => Self::Int2,
+            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0 => Self::Float8E8M0,
+            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT6E2M3 => Self::Float6E2M3,
+            O::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT6E3M2 => Self::Float6E3M2,
             _ => Self::Undefined,
         }
+    }
+}
+
+#[cfg(test)]
+mod element_type_tests {
+    use super::ElementType;
+    use onyxrt_sys::ONNXTensorElementDataType as Native;
+
+    #[test]
+    fn maps_float6_types() {
+        assert_eq!(
+            ElementType::from(Native::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT6E2M3),
+            ElementType::Float6E2M3
+        );
+        assert_eq!(
+            ElementType::from(Native::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT6E3M2),
+            ElementType::Float6E3M2
+        );
     }
 }
 
@@ -479,6 +504,39 @@ impl Environment {
         Ok(names)
     }
 
+    /// Returns the devices advertised by registered execution providers.
+    ///
+    /// Each descriptor keeps this environment alive and can be used for
+    /// hardware metadata and ONNX Runtime 1.32 memory-capacity queries.
+    pub fn ep_devices(&self) -> device::Result<Vec<EpDevice>> {
+        let api = &self.inner.api;
+        let mut devices = ptr::null();
+        let mut count = 0;
+        status_call!(
+            api,
+            GetEpDevices(
+                self.inner.env as *const sys::OrtEnv,
+                &mut devices,
+                &mut count
+            )
+        )?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let devices = require_const_non_null(devices, "execution-provider device array")?;
+        // SAFETY: ORT returned an environment-owned array of exactly count
+        // immutable device pointers.
+        let devices = unsafe { std::slice::from_raw_parts(devices, count) };
+        devices
+            .iter()
+            .map(|device| {
+                let device = require_const_non_null(*device, "execution-provider device")?;
+                Ok(EpDevice::from_raw(self.clone(), device))
+            })
+            .collect::<std::result::Result<Vec<_>, ffi::Error>>()
+            .map_err(Into::into)
+    }
+
     /// Starts configuring a CPU session.
     pub fn session_builder(&self) -> SessionBuilder {
         SessionBuilder {
@@ -499,6 +557,7 @@ impl Environment {
             config_entries: Vec::new(),
             custom_ops_libraries: Vec::new(),
             external_data_files: Vec::new(),
+            weightless_source_model: None,
         }
     }
 }

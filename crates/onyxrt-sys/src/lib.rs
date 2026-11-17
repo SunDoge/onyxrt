@@ -25,18 +25,6 @@ use snafu::Snafu;
 mod bindings;
 pub use bindings::*;
 
-// Stable ONNX element-type discriminants introduced after the vendored API 21
-// header. They remain plain wrapper constants so generated bindings stay an
-// unmodified representation of that header.
-pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1: ONNXTensorElementDataType =
-    ONNXTensorElementDataType(23);
-pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2: ONNXTensorElementDataType =
-    ONNXTensorElementDataType(24);
-pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2: ONNXTensorElementDataType =
-    ONNXTensorElementDataType(25);
-pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0: ONNXTensorElementDataType =
-    ONNXTensorElementDataType(26);
-
 /// Errors produced while loading the ONNX Runtime C API.
 #[derive(Debug, Snafu)]
 pub enum Error {

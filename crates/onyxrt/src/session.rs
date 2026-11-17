@@ -53,6 +53,11 @@ pub enum Error {
 
     #[snafu(display("unsupported ONNX value type {value_type:?}; expected a tensor"))]
     UnsupportedValueType { value_type: sys::ONNXType },
+
+    #[snafu(display(
+        "session configuration `{key}` cannot be enabled through the safe API because it may borrow initializer buffers for the session lifetime"
+    ))]
+    BorrowedInitializerConfig { key: String },
 }
 
 impl From<ffi::Error> for Error {
@@ -86,6 +91,7 @@ pub struct SessionBuilder {
     pub(super) config_entries: Vec<(String, String)>,
     pub(super) custom_ops_libraries: Vec<PathBuf>,
     pub(super) external_data_files: Vec<(String, Vec<u8>)>,
+    pub(super) weightless_source_model: Option<Arc<[u8]>>,
 }
 
 /// A named value supplied while creating a session.
@@ -192,9 +198,13 @@ impl SessionBuilder {
     }
 
     /// Adds a low-level ONNX Runtime session configuration entry.
-    pub fn config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn config(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
         let key = key.into();
         let value = value.into();
+        ensure!(
+            key != "session.use_external_initializer_file_buffers_directly" || value != "1",
+            BorrowedInitializerConfigSnafu { key }
+        );
         if let Some(existing) = self
             .config_entries
             .iter_mut()
@@ -204,7 +214,7 @@ impl SessionBuilder {
         } else {
             self.config_entries.push((key, value));
         }
-        self
+        Ok(self)
     }
 
     /// Registers a shared library that exports ONNX Runtime custom operators.
@@ -224,6 +234,16 @@ impl SessionBuilder {
     ) -> Self {
         self.external_data_files
             .push((name.into(), contents.into()));
+        self
+    }
+
+    /// Retains an original ONNX model for sessions created from a weightless
+    /// EPContext model.
+    ///
+    /// The bytes are shared with every session built from this builder and are
+    /// kept alive for each native session's full lifetime.
+    pub fn weightless_source_model(mut self, model: impl Into<Arc<[u8]>>) -> Self {
+        self.weightless_source_model = Some(model.into());
         self
     }
 
@@ -278,6 +298,7 @@ impl SessionBuilder {
         Ok(Session {
             environment: self.environment.clone(),
             session: session as usize,
+            _weightless_source_model: self.weightless_source_model.clone(),
         })
     }
 
@@ -312,6 +333,7 @@ impl SessionBuilder {
         Ok(Session {
             environment: self.environment.clone(),
             session: session as usize,
+            _weightless_source_model: self.weightless_source_model.clone(),
         })
     }
 
@@ -347,7 +369,7 @@ impl SessionBuilder {
         Ok(())
     }
 
-    fn create_options(&self) -> Result<OrtOwned<'_, sys::OrtSessionOptions>> {
+    pub(crate) fn create_options(&self) -> Result<OrtOwned<'_, sys::OrtSessionOptions>> {
         let api = &self.environment.inner.api;
         let mut options = ptr::null_mut();
         // SAFETY: output points to writable storage.
@@ -419,6 +441,18 @@ impl SessionBuilder {
             status_call!(
                 api,
                 AddSessionConfigEntry(options, key.as_ptr(), value.as_ptr())
+            )?;
+        }
+        if let Some(model) = &self.weightless_source_model {
+            // SAFETY: the builder owns the bytes and every created Session
+            // retains the same Arc for its full native lifetime.
+            status_call!(
+                api,
+                SessionOptionsSetWeightlessSourceModelBuffer(
+                    options,
+                    model.as_ptr().cast(),
+                    model.len()
+                )
             )?;
         }
         for path in &self.custom_ops_libraries {
@@ -842,6 +876,7 @@ impl Drop for RunOptions {
 pub struct Session {
     pub(super) environment: Environment,
     pub(super) session: usize,
+    pub(super) _weightless_source_model: Option<Arc<[u8]>>,
 }
 
 // SAFETY: ORT sessions support concurrent Run calls and the wrapper holds no
