@@ -66,6 +66,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn download_header(check: bool) -> Result<(), Box<dyn Error>> {
+    if check {
+        for &(name, expected_hash) in HEADERS {
+            verify_file_hash(
+                &header_directory().join(name),
+                expected_hash,
+                "vendored ONNX Runtime header",
+            )?;
+        }
+        println!("vendored ONNX Runtime v{ORT_VERSION} header bundle is current");
+        return Ok(());
+    }
+
     let client: ureq::Agent = ureq::Agent::config_builder()
         .user_agent(concat!("onyxrt-xtask/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -82,9 +94,7 @@ fn download_header(check: bool) -> Result<(), Box<dyn Error>> {
         }
 
         let destination = header_directory().join(name);
-        if check {
-            check_contents(&destination, &contents, "ONNX Runtime header")?;
-        } else if write_if_changed(&destination, &contents)? {
+        if write_if_changed(&destination, &contents)? {
             println!("downloaded {name} to {}", destination.display());
         }
     }
